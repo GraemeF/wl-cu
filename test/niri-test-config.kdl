@@ -1,0 +1,6 @@
+// Minimal niri config for the nested test session.
+// Launch with: just nested
+
+hotkey-overlay {
+    skip-at-startup
+}
