@@ -8,6 +8,29 @@ drive a niri desktop with it.
 
 ## Commands
 
+### Nested sessions
+
+```bash
+niri-cu start my_session       # starts nested niri and makes it the active target
+```
+
+`start` prints `{"name","pid","wayland_display","niri_socket","log"}` JSON.
+`start` creates a single reusable nested-session config at
+`$XDG_CONFIG_HOME/niri-cu/nested.kdl` (or `~/.config/niri-cu/nested.kdl`) if it
+does not already exist. Runtime session state and logs live under
+`$XDG_RUNTIME_DIR/niri-cu`.
+
+After that, other `niri-cu` commands automatically target the active nested
+session; you do not need to export `WAYLAND_DISPLAY` or `NIRI_SOCKET` for every
+call. When multiple sessions are running, pass `--session NAME` on any command:
+
+```bash
+niri-cu start left
+niri-cu start right
+niri-cu --session left screenshot
+niri-cu --session right observe --pretty
+```
+
 ### Observation
 
 ```bash
@@ -106,7 +129,10 @@ niri runs nested as a window inside an existing session, with its own
 without touching the real desktop:
 
 ```bash
-just nested        # starts niri with test/niri-test-config.kdl
+niri-cu start my_session       # starts nested niri and remembers its sockets
+niri-cu --session my_session screenshot
+# or, for manual testing:
+just nested                    # starts niri with test/niri-test-config.kdl
 ```
 
 The nested instance logs its socket names on startup
