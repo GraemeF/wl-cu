@@ -191,17 +191,85 @@ impl Client {
         self.flush()
     }
 
+    pub fn set_named_modifiers(&mut self, names: &[String]) -> Result<()> {
+        let mut modifiers = 0u32;
+        for name in names {
+            let mask = modifier_mod_name(name)
+                .and_then(|name| self.mod_mask(name))
+                .with_context(|| format!("unknown mouse-action modifier {name:?}"))?;
+            modifiers |= mask;
+        }
+        self.set_modifiers(modifiers)
+    }
+
+    pub fn clear_modifiers(&mut self) -> Result<()> {
+        self.set_modifiers(0)
+    }
+
+    pub fn sync(&mut self) -> Result<()> {
+        self.event_queue
+            .roundtrip(&mut State::default())
+            .context("failed to synchronize virtual keyboard")?;
+        Ok(())
+    }
+
+    pub fn type_text(&mut self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let mut strokes = Vec::with_capacity(text.chars().count());
+        for ch in text.chars() {
+            let keysym = char_keysym(ch);
+            let stroke = self.stroke_for_keysym(keysym).with_context(|| {
+                format!("character {ch:?} is not reachable in the seat's keyboard layout")
+            })?;
+            strokes.push(stroke);
+        }
+        for stroke in strokes {
+            self.send_stroke(stroke)?;
+            std::thread::sleep(KEY_DELAY);
+        }
+        self.drain()
+    }
+
+    pub fn key_combo(&mut self, combo: &str, hold: Option<Duration>) -> Result<()> {
+        let parts: Vec<&str> = combo.split('+').map(str::trim).collect();
+        let (key, modifier_parts) = parts.split_last().context("empty key combo")?;
+        if key.is_empty() {
+            bail!("key combo {combo:?} has no final key (write a literal plus as \"plus\")");
+        }
+
+        let mut modifiers = 0u32;
+        for part in modifier_parts {
+            let mask = modifier_mod_name(part)
+                .and_then(|name| self.mod_mask(name))
+                .with_context(|| format!("unknown modifier {part:?} in combo {combo:?}"))?;
+            modifiers |= mask;
+        }
+        let keysym = key_keysym(key).with_context(|| format!("unknown key {key:?}"))?;
+        let mut stroke = self.stroke_for_keysym(keysym).with_context(|| {
+            format!("key {key:?} is not reachable in the seat's keyboard layout")
+        })?;
+        stroke.mods |= modifiers;
+
+        match hold {
+            Some(hold) => self.send_stroke_held(stroke, hold)?,
+            None => self.send_stroke(stroke)?,
+        }
+        self.drain()
+    }
+
     /// Let in-flight events reach the focused client before the virtual
     /// keyboard is destroyed on process exit.
     fn drain(&mut self) -> Result<()> {
-        self.flush()?;
+        self.sync()?;
         std::thread::sleep(DRAIN_DELAY);
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
         self.event_queue
-            .roundtrip(&mut State::default())
+            .flush()
             .context("failed to flush virtual keyboard request")?;
         Ok(())
     }
@@ -212,54 +280,15 @@ pub fn type_text(text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-
     let mut client = Client::connect()?;
-    let mut strokes = Vec::with_capacity(text.chars().count());
-    for ch in text.chars() {
-        let keysym = char_keysym(ch);
-        let stroke = client.stroke_for_keysym(keysym).with_context(|| {
-            format!("character {ch:?} is not reachable in the seat's keyboard layout")
-        })?;
-        strokes.push(stroke);
-    }
-
-    for stroke in strokes {
-        client.send_stroke(stroke)?;
-        std::thread::sleep(KEY_DELAY);
-    }
-    client.drain()
+    client.type_text(text)
 }
 
 /// Press a key combo like "ctrl+shift+t", "Return", or "super+1".
 /// `hold` keeps the final key pressed for the given duration.
 pub fn key_combo(combo: &str, hold: Option<Duration>) -> Result<()> {
-    let parts: Vec<&str> = combo.split('+').map(str::trim).collect();
-    let (key, modifier_parts) = parts.split_last().context("empty key combo")?;
-    if key.is_empty() {
-        bail!("key combo {combo:?} has no final key (write a literal plus as \"plus\")");
-    }
-
     let mut client = Client::connect()?;
-
-    let mut modifiers = 0u32;
-    for part in modifier_parts {
-        let mask = modifier_mod_name(part)
-            .and_then(|name| client.mod_mask(name))
-            .with_context(|| format!("unknown modifier {part:?} in combo {combo:?}"))?;
-        modifiers |= mask;
-    }
-
-    let keysym = key_keysym(key).with_context(|| format!("unknown key {key:?}"))?;
-    let mut stroke = client
-        .stroke_for_keysym(keysym)
-        .with_context(|| format!("key {key:?} is not reachable in the seat's keyboard layout"))?;
-    stroke.mods |= modifiers;
-
-    match hold {
-        Some(hold) => client.send_stroke_held(stroke, hold)?,
-        None => client.send_stroke(stroke)?,
-    }
-    client.drain()
+    client.key_combo(combo, hold)
 }
 
 /// xkb real-modifier name for a user-supplied modifier.

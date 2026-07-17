@@ -105,7 +105,7 @@ impl Client {
     /// click gets its own flush: batching multiple clicks into one compositor
     /// tick stops clients from recognizing them as double/triple clicks.
     pub fn click_times(&mut self, button: Button, count: u32) -> Result<()> {
-        for _ in 0..count {
+        for index in 0..count {
             let time = now_millis();
             self.pointer
                 .button(time, button.code(), wl_pointer::ButtonState::Pressed);
@@ -117,6 +117,9 @@ impl Client {
             );
             self.pointer.frame();
             self.flush()?;
+            if index + 1 < count {
+                std::thread::sleep(Duration::from_millis(40));
+            }
         }
         Ok(())
     }
@@ -130,17 +133,32 @@ impl Client {
         steps: u32,
     ) -> Result<()> {
         let steps = steps.max(1);
-
-        self.move_absolute(from.0, from.1, extent)?;
-        std::thread::sleep(Duration::from_millis(20));
-        self.press(button)?;
-        std::thread::sleep(Duration::from_millis(20));
-
+        let mut path = Vec::with_capacity(steps as usize + 1);
+        path.push(from);
         for step in 1..=steps {
             let t = f64::from(step) / f64::from(steps);
             let x = f64::from(from.0) + (f64::from(to.0) - f64::from(from.0)) * t;
             let y = f64::from(from.1) + (f64::from(to.1) - f64::from(from.1)) * t;
-            self.move_absolute(x.round() as u32, y.round() as u32, extent)?;
+            path.push((x.round() as u32, y.round() as u32));
+        }
+        self.drag_path(&path, extent, button)
+    }
+
+    pub fn drag_path(&mut self, path: &[(u32, u32)], extent: Extent, button: Button) -> Result<()> {
+        let (start, rest) = path
+            .split_first()
+            .context("drag path must contain at least two points")?;
+        if rest.is_empty() {
+            bail!("drag path must contain at least two points");
+        }
+
+        self.move_absolute(start.0, start.1, extent)?;
+        std::thread::sleep(Duration::from_millis(20));
+        self.press(button)?;
+        std::thread::sleep(Duration::from_millis(20));
+
+        for &(x, y) in rest {
+            self.move_absolute(x, y, extent)?;
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -149,6 +167,7 @@ impl Client {
     }
 
     pub fn scroll(&mut self, dx: f64, dy: f64) -> Result<()> {
+        self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
         if dy != 0.0 {
             self.pointer
                 .axis(now_millis(), wl_pointer::Axis::VerticalScroll, dy);
@@ -161,9 +180,21 @@ impl Client {
         self.flush()
     }
 
-    fn flush(&mut self) -> Result<()> {
+    pub fn scroll_at(&mut self, x: u32, y: u32, extent: Extent, dx: f64, dy: f64) -> Result<()> {
+        self.move_absolute(x, y, extent)?;
+        self.scroll(dx, dy)
+    }
+
+    pub fn sync(&mut self) -> Result<()> {
         self.event_queue
             .roundtrip(&mut State)
+            .context("failed to synchronize virtual pointer")?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.event_queue
+            .flush()
             .context("failed to flush virtual pointer request")?;
         Ok(())
     }

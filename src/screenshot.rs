@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use image::imageops::FilterType;
 use image::RgbaImage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
@@ -14,7 +14,7 @@ use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{
 };
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Region {
     pub x: u32,
     pub y: u32,
@@ -22,11 +22,54 @@ pub struct Region {
     pub height: u32,
 }
 
-#[derive(Debug, Serialize)]
-pub struct Screenshot {
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Extent {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappedPoint {
+    pub x: u32,
+    pub y: u32,
+    pub extent: Extent,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Frame {
+    pub frame_id: String,
     pub path: PathBuf,
     pub width: u32,
     pub height: u32,
+    pub output: String,
+    pub source_region: Region,
+    pub extent: Extent,
+}
+
+impl Frame {
+    pub fn map_point(&self, x: u32, y: u32) -> Result<MappedPoint> {
+        if self.width == 0 || self.height == 0 {
+            bail!("frame dimensions must be non-zero");
+        }
+        if x >= self.width || y >= self.height {
+            bail!(
+                "coordinate ({x}, {y}) is outside frame {}x{}",
+                self.width,
+                self.height
+            );
+        }
+        let mapped_x = u64::from(self.source_region.x)
+            + (u64::from(x) * u64::from(self.source_region.width) + u64::from(self.width) / 2)
+                / u64::from(self.width);
+        let mapped_y = u64::from(self.source_region.y)
+            + (u64::from(y) * u64::from(self.source_region.height) + u64::from(self.height) / 2)
+                / u64::from(self.height);
+        Ok(MappedPoint {
+            x: mapped_x as u32,
+            y: mapped_y as u32,
+            extent: self.extent,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,11 +92,7 @@ struct State {
 }
 
 /// Capture the focused niri output and write it as a PNG.
-pub fn capture(
-    out: Option<&Path>,
-    max_dim: Option<u32>,
-    region: Option<Region>,
-) -> Result<Screenshot> {
+pub fn capture(out: Option<&Path>, max_dim: Option<u32>, region: Option<Region>) -> Result<Frame> {
     let focused_name = crate::niri::focused_output().ok().flatten().map(|o| o.name);
 
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
@@ -92,7 +131,7 @@ pub fn capture(
         .roundtrip(&mut state)
         .context("failed to collect output names")?;
 
-    let (output, transform) = pick_output(
+    let (output, transform, output_name) = pick_output(
         &outputs,
         &state.output_names,
         &state.output_transforms,
@@ -145,6 +184,16 @@ pub fn capture(
     let mmap = unsafe { memmap2::Mmap::map(&file) }.context("failed to map screenshot buffer")?;
     let mut img = to_rgba(&mmap, params, state.y_invert)?;
     img = untransform(img, transform);
+    let extent = Extent {
+        width: img.width(),
+        height: img.height(),
+    };
+    let source_region = region.unwrap_or(Region {
+        x: 0,
+        y: 0,
+        width: extent.width,
+        height: extent.height,
+    });
 
     buffer.destroy();
     pool.destroy();
@@ -154,7 +203,15 @@ pub fn capture(
         if region.width == 0 || region.height == 0 {
             bail!("region must have non-zero width and height");
         }
-        if region.x + region.width > img.width() || region.y + region.height > img.height() {
+        if region
+            .x
+            .checked_add(region.width)
+            .is_none_or(|x| x > img.width())
+            || region
+                .y
+                .checked_add(region.height)
+                .is_none_or(|y| y > img.height())
+        {
             bail!(
                 "region {},{} {}x{} exceeds screenshot bounds {}x{}",
                 region.x,
@@ -190,11 +247,17 @@ pub fn capture(
     img.save(&path)
         .with_context(|| format!("failed to write screenshot to {}", path.display()))?;
 
-    Ok(Screenshot {
+    let frame = Frame {
+        frame_id: new_frame_id(),
         path,
         width,
         height,
-    })
+        output: output_name,
+        source_region,
+        extent,
+    };
+    store_frame(&frame)?;
+    Ok(frame)
 }
 
 fn pick_output<'a>(
@@ -202,22 +265,71 @@ fn pick_output<'a>(
     names: &[Option<String>],
     transforms: &[wl_output::Transform],
     focused: Option<&str>,
-) -> Result<(&'a wl_output::WlOutput, wl_output::Transform)> {
+) -> Result<(&'a wl_output::WlOutput, wl_output::Transform, String)> {
     if let Some(focused) = focused {
         for (index, name) in names.iter().enumerate() {
             if name.as_deref() == Some(focused) {
-                return Ok((&outputs[index], transforms[index]));
+                return Ok((&outputs[index], transforms[index], focused.to_owned()));
             }
         }
     }
     if outputs.len() == 1 {
-        return Ok((&outputs[0], transforms[0]));
+        return Ok((
+            &outputs[0],
+            transforms[0],
+            names[0].clone().unwrap_or_else(|| "unknown".to_owned()),
+        ));
     }
     bail!(
         "cannot pick an output: niri focused output {:?} not found among compositor outputs {:?}",
         focused,
         names
     )
+}
+
+pub fn load_frame(frame_id: &str) -> Result<Frame> {
+    validate_frame_id(frame_id)?;
+    let path = frame_dir().join(format!("{frame_id}.json"));
+    let json = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read frame metadata from {}", path.display()))?;
+    serde_json::from_str(&json)
+        .with_context(|| format!("failed to parse frame metadata from {}", path.display()))
+}
+
+fn store_frame(frame: &Frame) -> Result<()> {
+    let dir = frame_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create frame directory {}", dir.display()))?;
+    let path = dir.join(format!("{}.json", frame.frame_id));
+    std::fs::write(&path, serde_json::to_vec(frame)?)
+        .with_context(|| format!("failed to write frame metadata to {}", path.display()))
+}
+
+fn frame_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("niri-cu")
+        .join("frames")
+}
+
+fn new_frame_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
+}
+
+fn validate_frame_id(frame_id: &str) -> Result<()> {
+    if frame_id.is_empty()
+        || !frame_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!("invalid frame ID {frame_id:?}");
+    }
+    Ok(())
 }
 
 /// Screencopy delivers the buffer in the output's framebuffer orientation;
