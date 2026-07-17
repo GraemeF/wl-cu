@@ -89,6 +89,62 @@ fn sessions_reports_an_empty_json_list_in_a_fresh_runtime() {
 }
 
 #[test]
+fn nested_sessions_have_independent_configs() {
+    let runtime = isolated_runtime_dir();
+    let fake_bin = install_fake_niri(&runtime);
+    let host_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", fake_bin.display(), host_path.to_string_lossy());
+
+    let first = cli(&runtime)
+        .args(["start", "first"])
+        .env("PATH", &path)
+        .output()
+        .expect("start first nested niri");
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let first_config = runtime.join("config/niri-cu/sessions/first.kdl");
+    fs::write(&first_config, "// first session only\n").expect("customize first config");
+
+    let second = cli(&runtime)
+        .args(["start", "second"])
+        .env("PATH", &path)
+        .output()
+        .expect("start second nested niri");
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let second_config = runtime.join("config/niri-cu/sessions/second.kdl");
+    assert_eq!(
+        fs::read_to_string(&first_config).expect("read first config"),
+        "// first session only\n"
+    );
+    assert!(fs::read_to_string(&second_config)
+        .expect("read second config")
+        .contains("default-column-width { proportion 1.0; }"));
+
+    for name in ["first", "second"] {
+        let stopped = cli(&runtime)
+            .args(["stop", name])
+            .output()
+            .expect("stop nested niri");
+        assert!(
+            stopped.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+    }
+
+    fs::remove_dir_all(runtime).expect("remove isolated runtime directory");
+}
+
+#[test]
 fn nested_session_can_be_started_used_and_stopped() {
     let runtime = isolated_runtime_dir();
     let fake_bin = install_fake_niri(&runtime);
@@ -104,6 +160,17 @@ fn nested_session_can_be_started_used_and_stopped() {
         started.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&started.stderr)
+    );
+
+    let nested_config_path = runtime.join("config/niri-cu/sessions/lifecycle.kdl");
+    let nested_config =
+        fs::read_to_string(&nested_config_path).expect("read generated nested config");
+    assert!(nested_config.contains("default-column-width { proportion 1.0; }"));
+    let started_json: serde_json::Value =
+        serde_json::from_slice(&started.stdout).expect("started session JSON");
+    assert_eq!(
+        started_json["config"],
+        nested_config_path.to_string_lossy().as_ref()
     );
 
     let status = cli(&runtime)

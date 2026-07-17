@@ -18,11 +18,18 @@ niri-cu --session my_session exec -- ghostty     # launch an app inside it
 niri-cu stop my_session                          # stop niri and launched apps
 ```
 
-`start` prints `{"name","pid","wayland_display","niri_socket","log"}` JSON.
-`start` creates a single reusable nested-session config at
-`$XDG_CONFIG_HOME/niri-cu/nested.kdl` (or `~/.config/niri-cu/nested.kdl`) if it
-does not already exist. Runtime session state and logs live under
-`$XDG_RUNTIME_DIR/niri-cu`.
+`start` prints `{"name","pid","wayland_display","niri_socket","config","log"}`
+JSON. Each session gets its own reusable config at
+`$XDG_CONFIG_HOME/niri-cu/sessions/NAME.kdl` (or
+`~/.config/niri-cu/sessions/NAME.kdl`). The generated config opens windows at
+the full output width by default, and `start` never overwrites it. niri watches
+its config for changes; to force an immediate reload of one session, run:
+
+```bash
+niri-cu --session NAME msg action load-config-file
+```
+
+Runtime session state and logs live under `$XDG_RUNTIME_DIR/niri-cu`.
 
 The compositor and applications launched by `exec` run in detached process
 groups, so they survive the short-lived harness command that started them.

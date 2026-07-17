@@ -1,6 +1,10 @@
 // Minimal niri config for the nested test session.
 // Launch with: just nested
 
+layout {
+    default-column-width { proportion 1.0; }
+}
+
 hotkey-overlay {
     skip-at-startup
 }
