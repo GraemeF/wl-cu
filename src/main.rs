@@ -31,6 +31,13 @@ enum Command {
         /// Session name, e.g. "test" or "my_session".
         name: String,
     },
+    /// Run a session-scoped command.
+    Session {
+        /// Session name.
+        name: String,
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// List known nested niri sessions and their current status.
     Sessions,
     /// Print the status of a named nested niri session.
@@ -224,6 +231,16 @@ enum Command {
     Capabilities,
 }
 
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Run `niri msg ...` against this session.
+    Msg {
+        /// Arguments passed after `niri msg`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum MouseButton {
     Left,
@@ -252,6 +269,7 @@ fn main() {
 fn run(session: Option<&str>, command: Command) -> Result<()> {
     match &command {
         Command::Start { .. }
+        | Command::Session { .. }
         | Command::Sessions
         | Command::Status { .. }
         | Command::Stop { .. }
@@ -261,6 +279,12 @@ fn run(session: Option<&str>, command: Command) -> Result<()> {
 
     match command {
         Command::Start { name } => print_json(&start_session(&name)?, false),
+        Command::Session { name, command } => {
+            activate_session(Some(&name))?;
+            match command {
+                SessionCommand::Msg { args } => run_niri_msg(args),
+            }
+        }
         Command::Sessions => print_json(&list_sessions()?, false),
         Command::Status { name } => print_json(&session_info(&name)?, false),
         Command::Stop { name } => print_json(&stop_session(&name)?, false),
@@ -1012,6 +1036,7 @@ fn capabilities() -> Capabilities {
         version: env!("CARGO_PKG_VERSION"),
         actions: &[
             "start",
+            "session",
             "sessions",
             "status",
             "stop",

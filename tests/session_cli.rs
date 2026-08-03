@@ -21,6 +21,17 @@ fn install_fake_niri(runtime: &Path) -> PathBuf {
     fs::write(
         &niri,
         r#"#!/bin/sh
+if [ "$1" = "msg" ]; then
+    shift
+    {
+        printf '%s\n' "$WAYLAND_DISPLAY"
+        printf '%s\n' "$NIRI_SOCKET"
+        printf '%s\n' "$@"
+    } > "$XDG_RUNTIME_DIR/msg-invocation"
+    printf 'proxied\n'
+    exit 0
+fi
+
 socket="$XDG_RUNTIME_DIR/niri.fake.$$.sock"
 touch "$socket"
 printf 'listening on Wayland socket: wayland-fake-%s\n' "$$"
@@ -299,6 +310,65 @@ fn nested_session_can_be_started_used_and_stopped() {
     assert!(
         stubborn_gone,
         "stop must kill spawned processes that ignore SIGTERM"
+    );
+
+    fs::remove_dir_all(runtime).expect("remove isolated runtime directory");
+}
+
+#[test]
+fn session_msg_proxies_niri_cli_to_the_named_session() {
+    let runtime = isolated_runtime_dir();
+    let fake_bin = install_fake_niri(&runtime);
+    let host_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", fake_bin.display(), host_path.to_string_lossy());
+
+    let started = cli(&runtime)
+        .args(["start", "proxy"])
+        .env("PATH", &path)
+        .output()
+        .expect("start fake nested niri");
+    assert!(
+        started.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let started: serde_json::Value =
+        serde_json::from_slice(&started.stdout).expect("started session JSON");
+
+    let proxied = cli(&runtime)
+        .args([
+            "session",
+            "proxy",
+            "msg",
+            "--json",
+            "action",
+            "focus-column-right",
+        ])
+        .env("PATH", &path)
+        .output()
+        .expect("proxy niri msg command");
+    assert!(
+        proxied.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&proxied.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&proxied.stdout), "proxied\n");
+
+    let invocation = fs::read_to_string(runtime.join("msg-invocation"))
+        .expect("fake niri recorded msg invocation");
+    let lines: Vec<_> = invocation.lines().collect();
+    assert!(lines[0].starts_with("wayland-fake-"));
+    assert_eq!(lines[1], started["niri_socket"].as_str().unwrap());
+    assert_eq!(&lines[2..], &["--json", "action", "focus-column-right"]);
+
+    let stopped = cli(&runtime)
+        .args(["stop", "proxy"])
+        .output()
+        .expect("stop fake nested niri");
+    assert!(
+        stopped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stopped.stderr)
     );
 
     fs::remove_dir_all(runtime).expect("remove isolated runtime directory");

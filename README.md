@@ -15,6 +15,7 @@ niri-cu start my_session                         # start or reuse a named sessio
 niri-cu sessions                                 # list known sessions and liveness
 niri-cu status my_session                        # inspect one session
 niri-cu --session my_session exec -- ghostty     # launch an app inside it
+niri-cu session my_session msg outputs            # proxy `niri msg` to it
 niri-cu stop my_session                          # stop niri and launched apps
 ```
 
@@ -26,7 +27,7 @@ the full output width by default, and `start` never overwrites it. niri watches
 its config for changes; to force an immediate reload of one session, run:
 
 ```bash
-niri-cu --session NAME msg action load-config-file
+niri-cu session NAME msg action load-config-file
 ```
 
 Runtime session state and logs live under `$XDG_RUNTIME_DIR/niri-cu`.
@@ -55,7 +56,7 @@ niri-cu --session my_session observe --pretty       # outputs + focused output/w
 niri-cu --session my_session outputs --pretty
 niri-cu --session my_session windows --pretty
 niri-cu --session my_session focused --pretty
-niri-cu --session my_session msg focused-window                  # proxy to `niri msg focused-window`
+niri-cu session my_session msg focused-window                    # proxy to `niri msg focused-window`
 niri-cu --session my_session screenshot                          # frame metadata JSON
 niri-cu --session my_session screenshot --out shot.png --max-dim 1080
 niri-cu --session my_session screenshot --region 100,100,800,600 # crop X,Y,WIDTH,HEIGHT
@@ -131,10 +132,12 @@ Use `msg` when you want raw `niri msg` behavior without exporting
 `NIRI_SOCKET` for the named nested session:
 
 ```bash
-niri-cu --session my_session msg outputs
-niri-cu --session my_session msg action focus-column-right
-niri-cu --session my_session msg --json windows
+niri-cu session my_session msg outputs
+niri-cu session my_session msg action focus-column-right
+niri-cu session my_session msg --json windows
 ```
+
+The existing `niri-cu --session my_session msg ...` form is also supported.
 
 ### Meta
 
