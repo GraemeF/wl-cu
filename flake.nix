@@ -1,5 +1,5 @@
 {
-  description = "niri-cu: niri-focused computer-use CLI";
+  description = "wl-cu: computer-use CLI for niri and Hyprland";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

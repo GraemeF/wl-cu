@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use niri_cu::screenshot::{Extent, Frame, Region};
+use wl_cu::screenshot::{Extent, Frame, Region};
 
 #[test]
 fn maps_coordinates_from_a_scaled_crop_back_to_the_full_output() {

@@ -1,5 +1,5 @@
 // Minimal niri config for the nested test session.
-// Launch with: just nested
+// Launch with: just nested-niri
 
 layout {
     default-column-width { proportion 1.0; }

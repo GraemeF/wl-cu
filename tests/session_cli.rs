@@ -9,7 +9,7 @@ fn isolated_runtime_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before epoch")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("niri-cu-test-{}-{nonce}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("wl-cu-test-{}-{nonce}", std::process::id()));
     fs::create_dir_all(&path).expect("create isolated runtime directory");
     path
 }
@@ -53,6 +53,50 @@ cleanup
     bin
 }
 
+fn install_fake_hyprland(runtime: &Path) -> PathBuf {
+    let bin = runtime.join("hypr-bin");
+    fs::create_dir_all(&bin).expect("create fake Hyprland bin directory");
+    let hyprland = bin.join("Hyprland");
+    fs::write(
+        &hyprland,
+        r#"#!/bin/sh
+signature="fake-hypr-$$"
+instance="$XDG_RUNTIME_DIR/hypr/$signature"
+mkdir -p "$instance"
+touch "$instance/.socket.sock"
+printf '%s\n%s\n' "$$" "wayland-hypr-$$" > "$instance/hyprland.lock"
+printf 'Instance Signature: %s\n' "$signature"
+printf 'WAYLAND_DISPLAY=wayland-hypr-%s\n' "$$"
+cleanup() { rm -rf "$instance"; exit 0; }
+trap cleanup TERM INT
+while :; do sleep 1; done
+"#,
+    )
+    .expect("write fake Hyprland");
+    let hyprctl = bin.join("hyprctl");
+    fs::write(
+        &hyprctl,
+        r#"#!/bin/sh
+{
+    printf '%s\n' "$WAYLAND_DISPLAY"
+    printf '%s\n' "$HYPRLAND_INSTANCE_SIGNATURE"
+    printf '%s\n' "$@"
+} > "$XDG_RUNTIME_DIR/hyprctl-invocation"
+printf 'ok\n'
+"#,
+    )
+    .expect("write fake hyprctl");
+    for executable in [&hyprland, &hyprctl] {
+        let mut permissions = fs::metadata(executable)
+            .expect("stat fake Hyprland executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions)
+            .expect("make fake Hyprland executable runnable");
+    }
+    bin
+}
+
 fn install_silent_niri(runtime: &Path) -> PathBuf {
     let bin = runtime.join("silent-bin");
     fs::create_dir_all(&bin).expect("create silent fake bin directory");
@@ -75,9 +119,11 @@ while :; do sleep 1; done
 }
 
 fn cli(runtime: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_niri-cu"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wl-cu"));
     command.env("XDG_RUNTIME_DIR", runtime);
     command.env("XDG_CONFIG_HOME", runtime.join("config"));
+    command.env_remove("NIRI_SOCKET");
+    command.env_remove("HYPRLAND_INSTANCE_SIGNATURE");
     command
 }
 
@@ -87,7 +133,7 @@ fn sessions_reports_an_empty_json_list_in_a_fresh_runtime() {
     let output = cli(&runtime)
         .arg("sessions")
         .output()
-        .expect("run niri-cu sessions");
+        .expect("run wl-cu sessions");
 
     assert!(
         output.status.success(),
@@ -107,7 +153,7 @@ fn nested_sessions_have_independent_configs() {
     let path = format!("{}:{}", fake_bin.display(), host_path.to_string_lossy());
 
     let first = cli(&runtime)
-        .args(["start", "first"])
+        .args(["--compositor", "niri", "start", "first"])
         .env("PATH", &path)
         .output()
         .expect("start first nested niri");
@@ -117,11 +163,11 @@ fn nested_sessions_have_independent_configs() {
         String::from_utf8_lossy(&first.stderr)
     );
 
-    let first_config = runtime.join("config/niri-cu/sessions/first.kdl");
+    let first_config = runtime.join("config/wl-cu/sessions/first.kdl");
     fs::write(&first_config, "// first session only\n").expect("customize first config");
 
     let second = cli(&runtime)
-        .args(["start", "second"])
+        .args(["--compositor", "niri", "start", "second"])
         .env("PATH", &path)
         .output()
         .expect("start second nested niri");
@@ -131,7 +177,7 @@ fn nested_sessions_have_independent_configs() {
         String::from_utf8_lossy(&second.stderr)
     );
 
-    let second_config = runtime.join("config/niri-cu/sessions/second.kdl");
+    let second_config = runtime.join("config/wl-cu/sessions/second.kdl");
     assert_eq!(
         fs::read_to_string(&first_config).expect("read first config"),
         "// first session only\n"
@@ -163,7 +209,7 @@ fn nested_session_can_be_started_used_and_stopped() {
     let path = format!("{}:{}", fake_bin.display(), host_path.to_string_lossy());
 
     let started = cli(&runtime)
-        .args(["start", "lifecycle"])
+        .args(["--compositor", "niri", "start", "lifecycle"])
         .env("PATH", &path)
         .output()
         .expect("start fake nested niri");
@@ -173,7 +219,7 @@ fn nested_session_can_be_started_used_and_stopped() {
         String::from_utf8_lossy(&started.stderr)
     );
 
-    let nested_config_path = runtime.join("config/niri-cu/sessions/lifecycle.kdl");
+    let nested_config_path = runtime.join("config/wl-cu/sessions/lifecycle.kdl");
     let nested_config =
         fs::read_to_string(&nested_config_path).expect("read generated nested config");
     assert!(nested_config.contains("default-column-width { proportion 1.0; }"));
@@ -323,7 +369,7 @@ fn session_msg_proxies_niri_cli_to_the_named_session() {
     let path = format!("{}:{}", fake_bin.display(), host_path.to_string_lossy());
 
     let started = cli(&runtime)
-        .args(["start", "proxy"])
+        .args(["--compositor", "niri", "start", "proxy"])
         .env("PATH", &path)
         .output()
         .expect("start fake nested niri");
@@ -358,7 +404,7 @@ fn session_msg_proxies_niri_cli_to_the_named_session() {
         .expect("fake niri recorded msg invocation");
     let lines: Vec<_> = invocation.lines().collect();
     assert!(lines[0].starts_with("wayland-fake-"));
-    assert_eq!(lines[1], started["niri_socket"].as_str().unwrap());
+    assert_eq!(lines[1], started["ipc"].as_str().unwrap());
     assert_eq!(&lines[2..], &["--json", "action", "focus-column-right"]);
 
     let stopped = cli(&runtime)
@@ -375,6 +421,94 @@ fn session_msg_proxies_niri_cli_to_the_named_session() {
 }
 
 #[test]
+fn hyprland_session_roundtrips_environment_and_messages() {
+    let runtime = isolated_runtime_dir();
+    let fake_bin = install_fake_hyprland(&runtime);
+    let host_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", fake_bin.display(), host_path.to_string_lossy());
+
+    let started = cli(&runtime)
+        .args(["--compositor", "hyprland", "start", "hypr"])
+        .env("PATH", &path)
+        .output()
+        .expect("start fake nested Hyprland");
+    assert!(
+        started.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let started: serde_json::Value =
+        serde_json::from_slice(&started.stdout).expect("started Hyprland session JSON");
+    assert_eq!(started["compositor"], "hyprland");
+    assert!(started["config"]
+        .as_str()
+        .expect("config path")
+        .ends_with("hypr.conf"));
+    assert!(runtime.join("config/wl-cu/sessions/hypr.conf").exists());
+
+    let status = cli(&runtime)
+        .args(["status", "hypr"])
+        .output()
+        .expect("read Hyprland session status");
+    let status: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("Hyprland status JSON");
+    assert_eq!(status["compositor"], "hyprland");
+    assert_eq!(status["running"], true);
+
+    let probe = runtime.join("hypr-environment.txt");
+    let command = format!(
+        "printf '%s|%s' \"$WAYLAND_DISPLAY\" \"$HYPRLAND_INSTANCE_SIGNATURE\" > {}",
+        probe.display()
+    );
+    let spawned = cli(&runtime)
+        .args(["--session", "hypr", "exec", "--", "sh", "-c", &command])
+        .output()
+        .expect("spawn command in Hyprland session");
+    assert!(
+        spawned.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&spawned.stderr)
+    );
+    for _ in 0..50 {
+        if probe.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let environment = fs::read_to_string(&probe).expect("read Hyprland child environment");
+    assert!(environment.starts_with("wayland-hypr-"));
+    assert!(environment.contains("|fake-hypr-"));
+
+    let message = cli(&runtime)
+        .args(["session", "hypr", "msg", "dispatch", "workspace", "2"])
+        .env("PATH", &path)
+        .output()
+        .expect("proxy hyprctl command");
+    assert!(
+        message.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&message.stderr)
+    );
+    let invocation =
+        fs::read_to_string(runtime.join("hyprctl-invocation")).expect("fake hyprctl invocation");
+    let lines: Vec<_> = invocation.lines().collect();
+    assert!(lines[0].starts_with("wayland-hypr-"));
+    assert!(lines[1].starts_with("fake-hypr-"));
+    assert_eq!(&lines[2..], &["dispatch", "workspace", "2"]);
+
+    let stopped = cli(&runtime)
+        .args(["stop", "hypr"])
+        .output()
+        .expect("stop fake nested Hyprland");
+    assert!(
+        stopped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    fs::remove_dir_all(runtime).expect("remove isolated runtime directory");
+}
+
+#[test]
 fn failed_start_does_not_leave_the_compositor_running() {
     let runtime = isolated_runtime_dir();
     let fake_bin = install_silent_niri(&runtime);
@@ -382,7 +516,7 @@ fn failed_start_does_not_leave_the_compositor_running() {
     let path = format!("{}:{}", fake_bin.display(), host_path.to_string_lossy());
 
     let started = cli(&runtime)
-        .args(["start", "silent"])
+        .args(["--compositor", "niri", "start", "silent"])
         .env("PATH", &path)
         .output()
         .expect("start silent fake nested niri");

@@ -1,81 +1,87 @@
-# niri-cu
+# wl-cu
 
-A self-contained, harness-agnostic computer-use CLI for [niri](https://github.com/YaLTeR/niri).
-Covers the full computer-use action vocabulary — screenshots, pointer, keyboard,
-plus structured niri state via IPC — with no runtime dependencies on `grim`,
-`wtype`, or similar tools. Any agent harness that can run a subprocess can
-drive a niri desktop with it.
+`wl-cu` is a computer-use CLI for niri and Hyprland. It starts isolated nested compositor sessions, launches applications inside them, captures screenshots, sends pointer and keyboard input, and reports normalized compositor state. It does not depend on `grim`, `wtype`, or compositor-specific input tools.
 
-## Commands
+Both backends use the same Wayland protocols for input, clipboard access, and capture. State queries use niri IPC or Hyprland's Unix socket.
 
-### Nested sessions
+## Start a session
+
+Choose the compositor when you create a session. Later commands read the choice from session state.
 
 ```bash
-niri-cu start my_session                         # start or reuse a named session
-niri-cu sessions                                 # list known sessions and liveness
-niri-cu status my_session                        # inspect one session
-niri-cu --session my_session exec -- ghostty     # launch an app inside it
-niri-cu session my_session msg outputs            # proxy `niri msg` to it
-niri-cu stop my_session                          # stop niri and launched apps
+wl-cu --compositor niri start test-niri
+wl-cu --compositor hyprland start test-hypr
+
+wl-cu --session test-niri exec -- ghostty
+wl-cu --session test-hypr exec -- foot
+wl-cu sessions
+wl-cu status test-hypr
+wl-cu stop test-niri
 ```
 
-`start` prints `{"name","pid","wayland_display","niri_socket","config","log"}`
-JSON. Each session gets its own reusable config at
-`$XDG_CONFIG_HOME/niri-cu/sessions/NAME.kdl` (or
-`~/.config/niri-cu/sessions/NAME.kdl`). The generated config opens windows at
-the full output width by default, and `start` never overwrites it. niri watches
-its config for changes; to force an immediate reload of one session, run:
+`start` prints the session name, compositor, PID, Wayland display, IPC path, config path, and log path as JSON. Config files live here:
 
-```bash
-niri-cu session NAME msg action load-config-file
+```text
+$XDG_CONFIG_HOME/wl-cu/sessions/NAME.kdl   # niri
+$XDG_CONFIG_HOME/wl-cu/sessions/NAME.conf  # Hyprland
 ```
 
-Runtime session state and logs live under `$XDG_RUNTIME_DIR/niri-cu`.
+If `XDG_CONFIG_HOME` is unset, `wl-cu` uses `~/.config/wl-cu`. It creates each config once and does not overwrite edits. Runtime state and logs live under `$XDG_RUNTIME_DIR/wl-cu`.
 
-The compositor and applications launched by `exec` run in detached process
-groups, so they survive the short-lived harness command that started them.
-`stop` terminates those process groups, escalating to `SIGKILL` after a grace
-period. Application stdout/stderr is appended to the `log` path printed by
-`exec`.
+Applications started by `exec` get the correct variables automatically:
 
-After that, pass `--session NAME` on each `niri-cu` command that should target
-the named nested session; you do not need to export `WAYLAND_DISPLAY` or
-`NIRI_SOCKET` for those calls:
+| Backend | Variables |
+|---|---|
+| niri | `WAYLAND_DISPLAY`, `NIRI_SOCKET` |
+| Hyprland | `WAYLAND_DISPLAY`, `HYPRLAND_INSTANCE_SIGNATURE` |
+
+`stop` terminates the compositor and every application launched through `exec`. It sends `SIGTERM`, waits briefly, then sends `SIGKILL` to any remaining process groups.
+
+You can also target the compositor in the current environment without a stored session:
 
 ```bash
-niri-cu start left
-niri-cu start right
-niri-cu --session left screenshot
-niri-cu --session right observe --pretty
+wl-cu --compositor hyprland outputs --pretty
 ```
 
-### Observation
+Selection order is `--compositor`, the stored session value, then `NIRI_SOCKET` or `HYPRLAND_INSTANCE_SIGNATURE`.
+
+## Observe compositor state
 
 ```bash
-niri-cu --session my_session observe --pretty       # outputs + focused output/window + windows
-niri-cu --session my_session outputs --pretty
-niri-cu --session my_session windows --pretty
-niri-cu --session my_session focused --pretty
-niri-cu session my_session msg focused-window                    # proxy to `niri msg focused-window`
-niri-cu --session my_session screenshot                          # frame metadata JSON
-niri-cu --session my_session screenshot --out shot.png --max-dim 1080
-niri-cu --session my_session screenshot --region 100,100,800,600 # crop X,Y,WIDTH,HEIGHT
+wl-cu --session test-niri observe --pretty
+wl-cu --session test-hypr outputs --pretty
+wl-cu --session test-hypr windows --pretty
+wl-cu --session test-hypr focused --pretty
 ```
 
-Screenshots capture the focused output (cursor included) via wlr-screencopy,
-handle output transforms, and write PNG. `--max-dim N` downscales so the
-longest edge is at most `N`; the printed `width`/`height` are always the
-emitted dimensions. Each response also includes `frame_id`, `output`, the
-full-output `extent`, and the pre-scale `source_region`; use the frame ID to
-map later actions back through both cropping and scaling.
+Both backends return the same `Output` and `Window` fields. Window IDs are strings because niri uses numeric IDs while Hyprland uses hexadecimal addresses.
 
-### Batched computer actions
-
-`run-actions` accepts the complete computer-use action vocabulary as one JSON
-batch, from `--input FILE` or stdin:
+Use `msg` for raw compositor commands:
 
 ```bash
-niri-cu --session my_session run-actions <<'JSON'
+wl-cu session test-niri msg action focus-column-right
+wl-cu session test-hypr msg dispatch workspace 2
+wl-cu --session test-hypr msg monitors
+```
+
+The niri backend runs `niri msg`. The Hyprland backend runs `hyprctl`.
+
+## Screenshots
+
+```bash
+wl-cu --session test-hypr screenshot
+wl-cu --session test-hypr screenshot --out shot.png --max-dim 1080
+wl-cu --session test-hypr screenshot --region 100,100,800,600
+```
+
+Capture uses `zwlr_screencopy`, includes the cursor, and handles output transforms. The JSON response contains `frame_id`, `path`, emitted `width` and `height`, output name, full-output `extent`, and the pre-scale `source_region`.
+
+## Action batches
+
+`run-actions` reads a GA-compatible JSON batch from `--input FILE` or stdin:
+
+```bash
+wl-cu --session test-hypr run-actions <<'JSON'
 {"actions":[
   {"type":"move","x":320,"y":240,"keys":["SHIFT"]},
   {"type":"click","x":320,"y":240,"button":"left"},
@@ -90,142 +96,76 @@ niri-cu --session my_session run-actions <<'JSON'
 JSON
 ```
 
-Mouse actions accept a `keys` array whose modifiers are held for the whole
-action. Drag follows every point in `path`; scroll first moves to its supplied
-`x`,`y`. `keypress` accepts either explicit combos such as `CTRL+L` or a
-modifier array such as `["CTRL","L"]`. The result reports
-`actions_executed` and the last screenshot frame, if any.
+Mouse actions accept modifiers in `keys`. Drag follows every point in `path`. The result reports the number of actions and the last screenshot frame, if the batch captured one.
 
-### Pointer
+## Direct input commands
 
 ```bash
-niri-cu --session my_session move --x 640 --y 420
-niri-cu --session my_session click --x 640 --y 420 [--button left|right|middle]
-niri-cu --session my_session double-click --x 640 --y 420
-niri-cu --session my_session triple-click --x 640 --y 420
-niri-cu --session my_session drag --from-x 100 --from-y 100 --to-x 400 --to-y 300 [--steps 20]
-niri-cu --session my_session scroll --dy -15        # current position; negative = up
-niri-cu --session my_session scroll --x 640 --y 420 --dy -15
+wl-cu --session test-niri move --x 640 --y 420
+wl-cu --session test-niri click --x 640 --y 420 --button left
+wl-cu --session test-niri double-click --x 640 --y 420
+wl-cu --session test-niri triple-click --x 640 --y 420
+wl-cu --session test-niri drag --from-x 100 --from-y 100 --to-x 400 --to-y 300
+wl-cu --session test-niri scroll --dy -15
+wl-cu --session test-niri type --text "echo hello"
+wl-cu --session test-niri key --combo ctrl+shift+t
 ```
 
-### Keyboard
+Typing reads the seat keymap and emits the keycodes and modifiers that produce each character. If the layout cannot produce a character, `wl-cu` publishes the string through Wayland data control and pastes it.
+
+## Coordinates and frames
+
+Pointer commands interpret coordinates against an extent. Without `--width` and `--height`, the focused output's logical size is the extent. Pass screenshot dimensions when coordinates came from a scaled image:
 
 ```bash
-niri-cu --session my_session type --text "echo hello world"
-niri-cu --session my_session key --combo Return
-niri-cu --session my_session key --combo ctrl+shift+t
-niri-cu --session my_session key --combo super+1 --hold 500ms
+wl-cu --session test-hypr click --x 453 --y 540 --width 906 --height 1080
 ```
 
-Typing works in the seat's **own keyboard layout**: niri-cu reads the seat
-keymap and emits the keycode/modifier combinations that produce each
-character — exactly like a physical keyboard. (Compositors do not reliably
-forward a virtual keyboard's custom keymap to focused clients, so the
-custom-keymap approach used by tools like wtype silently breaks; this one
-doesn't.) If a character is not reachable in that layout, niri-cu publishes
-the full string through Wayland data-control and pastes it, which also covers
-Unicode text such as emoji.
-
-### niri IPC proxy
-
-Use `msg` when you want raw `niri msg` behavior without exporting
-`NIRI_SOCKET` for the named nested session:
+For cropped or scaled screenshots, use the frame ID. It maps coordinates through the crop and scale and rejects points outside the emitted image.
 
 ```bash
-niri-cu session my_session msg outputs
-niri-cu session my_session msg action focus-column-right
-niri-cu session my_session msg --json windows
-```
-
-The existing `niri-cu --session my_session msg ...` form is also supported.
-
-### Meta
-
-```bash
-niri-cu capabilities           # supported actions as JSON
-```
-
-## The coordinate contract
-
-All direct pointer commands accept `--width`/`--height` (the "extent"):
-coordinates are interpreted relative to that size and scaled by the
-compositor. By default the extent is the focused output's logical size, so
-coordinates map 1:1 to full-resolution screenshot pixels.
-
-The key property for agent harnesses: **pass your screenshot's dimensions as
-the extent and no coordinate math is ever needed**, even with downscaling:
-
-```bash
-niri-cu --session my_session screenshot --max-dim 1080          # → {"width":906,"height":1080}
-niri-cu --session my_session click --x 453 --y 540 --width 906 --height 1080   # center of that image
-```
-
-A model that picks coordinates off the (downscaled) screenshot can click them
-verbatim.
-
-For action batches, prefer the screenshot's `frame_id`. It covers both scaling
-and cropping and rejects coordinates outside the emitted image:
-
-```bash
-frame_id=$(niri-cu --session my_session screenshot \
+frame_id=$(wl-cu --session test-hypr screenshot \
   --region 100,100,800,600 --max-dim 400 | jq -r .frame_id)
 printf '%s\n' '{"actions":[{"type":"click","x":200,"y":150}]}' |
-  niri-cu --session my_session run-actions --frame-id "$frame_id"
+  wl-cu --session test-hypr run-actions --frame-id "$frame_id"
 ```
 
-## Error contract
-
-Failures print `{"error":"..."}` to stderr and exit non-zero. Success output
-is JSON on stdout (action commands print nothing on success).
-
-## Limitations
-
-- `cursor-position` is not supported — Wayland clients cannot query the global
-  pointer position. Track the last `move`/`click` in the harness if needed.
-- Mouse buttons beyond left/right/middle aren't exposed.
-- Unicode fallback relies on the focused client supporting the conventional
-  `Ctrl+Shift+V` paste shortcut.
-
-## Install
+## Install and test
 
 ```bash
 just build
 just install
+just check
 ```
 
-Building links against `libxkbcommon`; on Nix use the dev shell
-(`nix develop`, or `nix develop -c just build`).
+Building links against `libxkbcommon`. On Nix, use `nix develop`.
 
-## Testing in a nested niri session
-
-niri runs nested as a window inside an existing session, with its own
-`WAYLAND_DISPLAY` and `NIRI_SOCKET` — a safe sandbox for driving niri-cu
-without touching the real desktop:
+To launch an unmanaged nested compositor:
 
 ```bash
-niri-cu start my_session
-niri-cu --session my_session exec -- ghostty
-niri-cu --session my_session screenshot
-niri-cu stop my_session
+just nested-niri
+just nested-hyprland
 ```
 
-For an unmanaged compositor window, `just nested` starts niri with
-`test/niri-test-config.kdl`. Named `niri-cu start` sessions are preferable for
-automation because they record the sockets and own application cleanup.
+The managed `start` command is better for automation because it records the sockets and owns child cleanup.
 
-The nested instance logs its socket names on startup
-(`listening on Wayland socket: wayland-N`, `IPC listening on: …`). To launch a
-test app manually against an unmanaged instance:
+## Upgrade from niri-cu
+
+The binary and state directories changed without a migration shim. Move any nested configs you want to keep, then reinstall:
 
 ```bash
-export WAYLAND_DISPLAY=wayland-2
-export NIRI_SOCKET=/run/user/1000/niri.wayland-2.<pid>.sock
-foot &             # any Wayland-native app as a test target
+mkdir -p ~/.config/wl-cu
+mv ~/.config/niri-cu/sessions ~/.config/wl-cu/
+cargo install --path . --locked --force
+rm -f ~/.cargo/bin/niri-cu
 ```
 
-Note: the nested winit backend runs software-rendered and schedules input
-lazily; it is noticeably flakier than a real session (occasional dropped or
-repeated input under load, GTK apps not registering double-click activation).
-niri-cu batches press/release pairs into single flushes to stay robust, but
-treat nested-session input glitches as environmental before suspecting a
-harness bug.
+Sessions are temporary, so old runtime state under `$XDG_RUNTIME_DIR/niri-cu` can be removed.
+
+## Error contract and limits
+
+Failures print `{"error":"..."}` to stderr and exit nonzero. Successful input-only commands print nothing.
+
+`cursor-position` is unavailable because Wayland clients cannot query the global pointer position. Only left, right, and middle mouse buttons are exposed. Unicode fallback requires the focused client to support `Ctrl+Shift+V` paste.
+
+Run `wl-cu capabilities` for the supported compositor and action lists.

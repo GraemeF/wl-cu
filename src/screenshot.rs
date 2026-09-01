@@ -91,9 +91,18 @@ struct State {
     failed: bool,
 }
 
-/// Capture the focused niri output and write it as a PNG.
-pub fn capture(out: Option<&Path>, max_dim: Option<u32>, region: Option<Region>) -> Result<Frame> {
-    let focused_name = crate::niri::focused_output().ok().flatten().map(|o| o.name);
+/// Capture the focused compositor output and write it as a PNG.
+pub fn capture(
+    compositor: &dyn crate::compositor::Compositor,
+    out: Option<&Path>,
+    max_dim: Option<u32>,
+    region: Option<Region>,
+) -> Result<Frame> {
+    let focused_name = compositor
+        .focused_output()
+        .ok()
+        .flatten()
+        .map(|output| output.name);
 
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
     let (globals, mut event_queue) =
@@ -154,7 +163,7 @@ pub fn capture(out: Option<&Path>, max_dim: Option<u32>, region: Option<Region>)
         .context("compositor offered no shm buffer for screencopy")?;
 
     let size = params.stride as usize * params.height as usize;
-    let memfd = rustix::fs::memfd_create("niri-cu-screencopy", rustix::fs::MemfdFlags::CLOEXEC)
+    let memfd = rustix::fs::memfd_create("wl-cu-screencopy", rustix::fs::MemfdFlags::CLOEXEC)
         .context("failed to create memfd for screenshot buffer")?;
     let file = File::from(memfd);
     file.set_len(size as u64)
@@ -281,7 +290,7 @@ fn pick_output<'a>(
         ));
     }
     bail!(
-        "cannot pick an output: niri focused output {:?} not found among compositor outputs {:?}",
+        "cannot pick an output: focused output {:?} not found among compositor outputs {:?}",
         focused,
         names
     )
@@ -309,7 +318,7 @@ fn frame_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("niri-cu")
+        .join("wl-cu")
         .join("frames")
 }
 
@@ -392,7 +401,7 @@ fn default_output_path() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    dir.join(format!("niri-cu-{nanos}.png"))
+    dir.join(format!("wl-cu-{nanos}.png"))
 }
 
 impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for State {

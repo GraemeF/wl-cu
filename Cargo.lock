@@ -279,24 +279,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "niri-cu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "image",
- "memmap2",
- "niri-ipc",
- "rustix",
- "serde",
- "serde_json",
- "wayland-client",
- "wayland-protocols-misc",
- "wayland-protocols-wlr",
- "xkbcommon",
-]
-
-[[package]]
 name = "niri-ipc"
 version = "26.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -572,6 +554,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "wl-cu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "image",
+ "memmap2",
+ "niri-ipc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "wayland-client",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "xkbcommon",
 ]
 
 [[package]]

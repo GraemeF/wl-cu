@@ -8,17 +8,22 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use niri_cu::actions::{keypress_combos, ActionBatch, ComputerAction};
-use niri_cu::{clipboard, keyboard, niri, pointer, screenshot};
 use serde::{Deserialize, Serialize};
+use wl_cu::actions::{keypress_combos, ActionBatch, ComputerAction};
+use wl_cu::compositor::{self, Compositor, CompositorKind, SessionHandles};
+use wl_cu::{clipboard, keyboard, pointer, screenshot};
 
 #[derive(Debug, Parser)]
-#[command(name = "niri-cu")]
-#[command(about = "Small niri-focused computer-use CLI")]
+#[command(name = "wl-cu")]
+#[command(about = "Computer-use CLI for niri and Hyprland")]
 struct Cli {
-    /// Target a named nested niri session.
+    /// Target a named nested compositor session.
     #[arg(long, global = true)]
     session: Option<String>,
+
+    /// Select niri or Hyprland. Stored sessions remember this value.
+    #[arg(long, global = true)]
+    compositor: Option<CompositorKind>,
 
     #[command(subcommand)]
     command: Command,
@@ -26,7 +31,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start a named nested niri session.
+    /// Start a named nested compositor session.
     Start {
         /// Session name, e.g. "test" or "my_session".
         name: String,
@@ -38,19 +43,19 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
-    /// List known nested niri sessions and their current status.
+    /// List known nested compositor sessions and their current status.
     Sessions,
-    /// Print the status of a named nested niri session.
+    /// Print the status of a named nested compositor session.
     Status {
         /// Session name.
         name: String,
     },
-    /// Stop a named nested niri session and its spawned applications.
+    /// Stop a named nested compositor session and its spawned applications.
     Stop {
         /// Session name.
         name: String,
     },
-    /// Spawn an application inside the selected nested niri session.
+    /// Spawn an application inside the selected nested compositor session.
     Exec {
         /// Command and arguments to execute after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -71,33 +76,33 @@ enum Command {
         #[arg(long, conflicts_with_all = ["width", "height"])]
         frame_id: Option<String>,
     },
-    /// Print a compact observation of niri state.
+    /// Print a compact observation of compositor state.
     Observe {
         /// Pretty-print JSON.
         #[arg(long)]
         pretty: bool,
     },
-    /// Print connected niri outputs as JSON.
+    /// Print connected outputs as JSON.
     Outputs {
         /// Pretty-print JSON.
         #[arg(long)]
         pretty: bool,
     },
-    /// Print open niri windows as JSON.
+    /// Print open windows as JSON.
     Windows {
         /// Pretty-print JSON.
         #[arg(long)]
         pretty: bool,
     },
-    /// Print the focused niri window as JSON.
+    /// Print the focused window as JSON.
     Focused {
         /// Pretty-print JSON.
         #[arg(long)]
         pretty: bool,
     },
-    /// Run `niri msg ...` against the named session.
+    /// Run the compositor message CLI against the selected session.
     Msg {
-        /// Arguments passed after `niri msg`.
+        /// Arguments passed to `niri msg` or `hyprctl`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -233,9 +238,9 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
-    /// Run `niri msg ...` against this session.
+    /// Run the compositor message CLI against this session.
     Msg {
-        /// Arguments passed after `niri msg`.
+        /// Arguments passed to `niri msg` or `hyprctl`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -260,34 +265,45 @@ impl From<MouseButton> for pointer::Button {
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(error) = run(cli.session.as_deref(), cli.command) {
+    if let Err(error) = run(cli.compositor, cli.session.as_deref(), cli.command) {
         eprintln!("{}", serde_json::json!({ "error": format!("{error:#}") }));
         std::process::exit(1);
     }
 }
 
-fn run(session: Option<&str>, command: Command) -> Result<()> {
-    match &command {
-        Command::Start { .. }
-        | Command::Session { .. }
-        | Command::Sessions
-        | Command::Status { .. }
-        | Command::Stop { .. }
-        | Command::Capabilities => {}
-        _ => activate_session(session)?,
-    }
-
+fn run(requested: Option<CompositorKind>, session: Option<&str>, command: Command) -> Result<()> {
     match command {
-        Command::Start { name } => print_json(&start_session(&name)?, false),
+        Command::Start { name } => {
+            let kind = requested.or_else(compositor::sniff_environment).context(
+                "pass --compositor niri|hyprland (no compositor environment was detected)",
+            )?;
+            print_json(&start_session(&name, kind)?, false)
+        }
         Command::Session { name, command } => {
-            activate_session(Some(&name))?;
+            let stored = activate_session(&name)?;
+            let backend = compositor::backend(requested.unwrap_or(stored));
             match command {
-                SessionCommand::Msg { args } => run_niri_msg(args),
+                SessionCommand::Msg { args } => run_compositor_msg(backend.as_ref(), args),
             }
         }
         Command::Sessions => print_json(&list_sessions()?, false),
         Command::Status { name } => print_json(&session_info(&name)?, false),
         Command::Stop { name } => print_json(&stop_session(&name)?, false),
+        Command::Capabilities => print_json(&capabilities(), false),
+        command => {
+            let kind = prepare_compositor(requested, session)?;
+            let backend = compositor::backend(kind);
+            run_compositor_command(session, command, backend.as_ref())
+        }
+    }
+}
+
+fn run_compositor_command(
+    session: Option<&str>,
+    command: Command,
+    compositor: &dyn Compositor,
+) -> Result<()> {
+    match command {
         Command::Exec { args } => {
             let name = session.context("pass --session NAME")?;
             print_json(&exec_in_session(name, args)?, false)
@@ -299,22 +315,23 @@ fn run(session: Option<&str>, command: Command) -> Result<()> {
             frame_id,
         } => print_json(
             &run_action_batch(
+                compositor,
                 input.as_deref(),
                 CoordinateSpace::new(frame_id.as_deref(), width, height)?,
             )?,
             false,
         ),
-        Command::Observe { pretty } => print_json(&niri::observe()?, pretty),
-        Command::Outputs { pretty } => print_json(&niri::outputs()?, pretty),
-        Command::Windows { pretty } => print_json(&niri::windows()?, pretty),
-        Command::Focused { pretty } => print_json(&niri::focused_window()?, pretty),
-        Command::Msg { args } => run_niri_msg(args),
+        Command::Observe { pretty } => print_json(&compositor::observe(compositor)?, pretty),
+        Command::Outputs { pretty } => print_json(&compositor.outputs()?, pretty),
+        Command::Windows { pretty } => print_json(&compositor.windows()?, pretty),
+        Command::Focused { pretty } => print_json(&compositor.focused_window()?, pretty),
+        Command::Msg { args } => run_compositor_msg(compositor, args),
         Command::Screenshot {
             out,
             max_dim,
             region,
         } => print_json(
-            &screenshot::capture(out.as_deref(), max_dim, region)?,
+            &screenshot::capture(compositor, out.as_deref(), max_dim, region)?,
             false,
         ),
         Command::Move {
@@ -323,7 +340,7 @@ fn run(session: Option<&str>, command: Command) -> Result<()> {
             width,
             height,
         } => {
-            let extent = pointer_extent(width, height)?;
+            let extent = pointer_extent(compositor, width, height)?;
             pointer::Client::connect()?.move_absolute(x, y, extent)?;
             Ok(())
         }
@@ -333,21 +350,21 @@ fn run(session: Option<&str>, command: Command) -> Result<()> {
             button,
             width,
             height,
-        } => click_times(x, y, button, width, height, 1),
+        } => click_times(compositor, x, y, button, width, height, 1),
         Command::DoubleClick {
             x,
             y,
             button,
             width,
             height,
-        } => click_times(x, y, button, width, height, 2),
+        } => click_times(compositor, x, y, button, width, height, 2),
         Command::TripleClick {
             x,
             y,
             button,
             width,
             height,
-        } => click_times(x, y, button, width, height, 3),
+        } => click_times(compositor, x, y, button, width, height, 3),
         Command::Drag {
             from_x,
             from_y,
@@ -358,7 +375,7 @@ fn run(session: Option<&str>, command: Command) -> Result<()> {
             width,
             height,
         } => {
-            let extent = pointer_extent(width, height)?;
+            let extent = pointer_extent(compositor, width, height)?;
             pointer::Client::connect()?.drag(
                 (from_x, from_y),
                 (to_x, to_y),
@@ -379,7 +396,7 @@ fn run(session: Option<&str>, command: Command) -> Result<()> {
             let mut client = pointer::Client::connect()?;
             match (x, y) {
                 (Some(x), Some(y)) => {
-                    client.scroll_at(x, y, pointer_extent(width, height)?, dx, dy)?;
+                    client.scroll_at(x, y, pointer_extent(compositor, width, height)?, dx, dy)?
                 }
                 (None, None) => client.scroll(dx, dy)?,
                 _ => unreachable!("clap requires x and y together"),
@@ -388,25 +405,34 @@ fn run(session: Option<&str>, command: Command) -> Result<()> {
         }
         Command::Type { text } => type_text(&text),
         Command::Key { combo, hold } => keyboard::key_combo(&combo, hold),
-        Command::Capabilities => print_json(&capabilities(), false),
+        Command::Start { .. }
+        | Command::Session { .. }
+        | Command::Sessions
+        | Command::Status { .. }
+        | Command::Stop { .. }
+        | Command::Capabilities => unreachable!("handled before compositor selection"),
     }
 }
 
 #[derive(Debug, Serialize)]
 struct StartedSession {
     name: String,
+    compositor: CompositorKind,
     pid: u32,
     wayland_display: String,
-    niri_socket: PathBuf,
+    ipc: PathBuf,
     config: PathBuf,
     log: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredSession {
+    #[serde(default)]
+    compositor: CompositorKind,
     pid: u32,
     wayland_display: String,
-    niri_socket: PathBuf,
+    #[serde(alias = "niri_socket")]
+    ipc: PathBuf,
     log: PathBuf,
     #[serde(default)]
     process_group: bool,
@@ -428,9 +454,10 @@ struct SessionState {
 #[derive(Debug, Serialize)]
 struct SessionInfo {
     name: String,
+    compositor: CompositorKind,
     pid: u32,
     wayland_display: String,
-    niri_socket: PathBuf,
+    ipc: PathBuf,
     config: PathBuf,
     log: PathBuf,
     running: bool,
@@ -444,11 +471,12 @@ fn list_sessions() -> Result<Vec<SessionInfo>> {
         .into_iter()
         .map(|(name, session)| SessionInfo {
             running: session_running(&session),
-            config: nested_config_path(&name),
+            config: nested_config_path(&name, session.compositor),
             name,
+            compositor: session.compositor,
             pid: session.pid,
             wayland_display: session.wayland_display,
-            niri_socket: session.niri_socket,
+            ipc: session.ipc,
             log: session.log,
             processes: session
                 .processes
@@ -465,14 +493,15 @@ fn list_sessions() -> Result<Vec<SessionInfo>> {
 fn session_info(name: &str) -> Result<SessionInfo> {
     let state = read_session_state()?;
     let session = state.sessions.get(name).with_context(|| {
-        format!("niri-cu session {name:?} is not known; run `niri-cu start {name}` first")
+        format!("wl-cu session {name:?} is not known; run `wl-cu start {name}` first")
     })?;
     Ok(SessionInfo {
         name: name.to_owned(),
+        compositor: session.compositor,
         pid: session.pid,
         wayland_display: session.wayland_display.clone(),
-        niri_socket: session.niri_socket.clone(),
-        config: nested_config_path(name),
+        ipc: session.ipc.clone(),
+        config: nested_config_path(name, session.compositor),
         log: session.log.clone(),
         running: session_running(session),
         processes: session
@@ -493,7 +522,7 @@ struct StoppedSession {
 fn stop_session(name: &str) -> Result<StoppedSession> {
     let mut state = read_session_state()?;
     let session = state.sessions.remove(name).with_context(|| {
-        format!("niri-cu session {name:?} is not known; run `niri-cu sessions` to list sessions")
+        format!("wl-cu session {name:?} is not known; run `wl-cu sessions` to list sessions")
     })?;
 
     for process in &session.processes {
@@ -574,13 +603,28 @@ impl CoordinateSpace {
         })
     }
 
-    fn map_point(&self, x: u32, y: u32) -> Result<(u32, u32, pointer::Extent)> {
+    fn map_point(
+        &self,
+        compositor: &dyn Compositor,
+        x: u32,
+        y: u32,
+    ) -> Result<(u32, u32, pointer::Extent)> {
         match self {
             Self::FocusedOutput => {
-                let extent = niri::focused_output_extent().context(
-                    "failed to infer action extent from focused niri output; pass --width and --height",
-                )?;
-                Ok((x, y, extent))
+                let extent = compositor.focused_output_extent().with_context(|| {
+                    format!(
+                        "failed to infer action extent from focused {} output; pass --width and --height",
+                        compositor.kind()
+                    )
+                })?;
+                Ok((
+                    x,
+                    y,
+                    pointer::Extent {
+                        width: extent.width,
+                        height: extent.height,
+                    },
+                ))
             }
             Self::Explicit(extent) => Ok((x, y, *extent)),
             Self::Frame(frame) => {
@@ -599,6 +643,7 @@ impl CoordinateSpace {
 }
 
 fn run_action_batch(
+    compositor: &dyn Compositor,
     input: Option<&std::path::Path>,
     coordinates: CoordinateSpace,
 ) -> Result<ActionBatchResult> {
@@ -619,22 +664,22 @@ fn run_action_batch(
     for action in &batch.actions {
         match action {
             ComputerAction::Screenshot => {
-                frame = Some(screenshot::capture(None, None, None)?);
+                frame = Some(screenshot::capture(compositor, None, None, None)?);
             }
             ComputerAction::Move { x, y, keys } => {
-                let (x, y, extent) = coordinates.map_point(*x, *y)?;
+                let (x, y, extent) = coordinates.map_point(compositor, *x, *y)?;
                 with_pointer_modifiers(keys, |pointer| pointer.move_absolute(x, y, extent))?;
             }
             ComputerAction::Click { x, y, button, keys } => {
                 with_pointer_modifiers(keys, |pointer| {
-                    let (x, y, extent) = coordinates.map_point(*x, *y)?;
+                    let (x, y, extent) = coordinates.map_point(compositor, *x, *y)?;
                     pointer.move_absolute(x, y, extent)?;
                     pointer.click(action_button(*button))
                 })?
             }
             ComputerAction::DoubleClick { x, y, button, keys } => {
                 with_pointer_modifiers(keys, |pointer| {
-                    let (x, y, extent) = coordinates.map_point(*x, *y)?;
+                    let (x, y, extent) = coordinates.map_point(compositor, *x, *y)?;
                     pointer.move_absolute(x, y, extent)?;
                     pointer.click_times(action_button(*button), 2)
                 })?
@@ -646,7 +691,7 @@ fn run_action_batch(
                 scroll_y,
                 keys,
             } => with_pointer_modifiers(keys, |pointer| {
-                let (x, y, extent) = coordinates.map_point(*x, *y)?;
+                let (x, y, extent) = coordinates.map_point(compositor, *x, *y)?;
                 pointer.scroll_at(x, y, extent, *scroll_x, *scroll_y)
             })?,
             ComputerAction::Type { text } => {
@@ -662,7 +707,7 @@ fn run_action_batch(
                 with_pointer_modifiers(keys, |pointer| {
                     let mapped: Result<Vec<_>> = path
                         .iter()
-                        .map(|point| coordinates.map_point(point.x, point.y))
+                        .map(|point| coordinates.map_point(compositor, point.x, point.y))
                         .collect();
                     let mapped = mapped?;
                     let extent = mapped[0].2;
@@ -681,11 +726,11 @@ fn run_action_batch(
     })
 }
 
-fn action_button(button: niri_cu::actions::MouseButton) -> pointer::Button {
+fn action_button(button: wl_cu::actions::MouseButton) -> pointer::Button {
     match button {
-        niri_cu::actions::MouseButton::Left => pointer::Button::Left,
-        niri_cu::actions::MouseButton::Right => pointer::Button::Right,
-        niri_cu::actions::MouseButton::Middle => pointer::Button::Middle,
+        wl_cu::actions::MouseButton::Left => pointer::Button::Left,
+        wl_cu::actions::MouseButton::Right => pointer::Button::Right,
+        wl_cu::actions::MouseButton::Middle => pointer::Button::Middle,
     }
 }
 
@@ -726,10 +771,10 @@ fn with_pointer_modifiers<T>(
 fn exec_in_session(name: &str, args: Vec<String>) -> Result<SpawnedProcess> {
     let mut state = read_session_state()?;
     let session = state.sessions.get_mut(name).with_context(|| {
-        format!("niri-cu session {name:?} is not known; run `niri-cu start {name}` first")
+        format!("wl-cu session {name:?} is not known; run `wl-cu start {name}` first")
     })?;
     if !session_running(session) {
-        bail!("niri-cu session {name:?} is not running");
+        bail!("wl-cu session {name:?} is not running");
     }
     let (program, arguments) = args
         .split_first()
@@ -743,10 +788,14 @@ fn exec_in_session(name: &str, args: Vec<String>) -> Result<SpawnedProcess> {
     let stderr = stdout
         .try_clone()
         .context("failed to clone application log handle")?;
-    let child = std::process::Command::new(program)
-        .args(arguments)
-        .env("WAYLAND_DISPLAY", &session.wayland_display)
-        .env("NIRI_SOCKET", &session.niri_socket)
+    let handles = session_handles(session);
+    let backend = compositor::backend(session.compositor);
+    let mut command = std::process::Command::new(program);
+    command.args(arguments);
+    for (key, value) in backend.session_env(&handles) {
+        command.env(key, value);
+    }
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -762,127 +811,151 @@ fn exec_in_session(name: &str, args: Vec<String>) -> Result<SpawnedProcess> {
     Ok(SpawnedProcess { pid, log })
 }
 
-fn start_session(name: &str) -> Result<StartedSession> {
+fn start_session(name: &str, kind: CompositorKind) -> Result<StartedSession> {
     validate_session_name(name)?;
     let mut state = read_session_state()?;
     if let Some(session) = state.sessions.get(name) {
         if session_running(session) {
-            let started = StartedSession {
+            if session.compositor != kind {
+                bail!(
+                    "session {name:?} is already running with {}; choose another name or stop it first",
+                    session.compositor
+                );
+            }
+            return Ok(StartedSession {
                 name: name.to_owned(),
+                compositor: session.compositor,
                 pid: session.pid,
                 wayland_display: session.wayland_display.clone(),
-                niri_socket: session.niri_socket.clone(),
-                config: nested_config_path(name),
+                ipc: session.ipc.clone(),
+                config: nested_config_path(name, session.compositor),
                 log: session.log.clone(),
-            };
-            return Ok(started);
+            });
         }
     }
 
     let dir = session_dir()?;
-    fs::create_dir_all(&dir).context("failed to create niri-cu runtime directory")?;
-
-    let config = ensure_nested_config(name)?;
-
+    fs::create_dir_all(&dir).context("failed to create wl-cu runtime directory")?;
+    let backend = compositor::backend(kind);
+    let config = ensure_nested_config(name, backend.as_ref())?;
     let log = dir.join(format!("{name}.log"));
     let log_file = File::create(&log)
-        .with_context(|| format!("failed to create nested niri log at {}", log.display()))?;
+        .with_context(|| format!("failed to create nested {kind} log at {}", log.display()))?;
     let stderr = log_file
         .try_clone()
-        .context("failed to clone nested niri log handle")?;
-
-    let mut child = std::process::Command::new("niri")
-        .arg("-c")
-        .arg(&config)
+        .with_context(|| format!("failed to clone nested {kind} log handle"))?;
+    let before =
+        (kind == CompositorKind::Hyprland).then(wl_cu::backend::hyprland::runtime_instances);
+    let mut command = backend.spawn_command(&config);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr))
         .process_group(0)
         .spawn()
-        .context("failed to start nested niri")?;
+        .with_context(|| format!("failed to start nested {kind}"))?;
 
-    let mut wayland_display = None;
-    let mut niri_socket = None;
+    let mut handles = None;
     for _ in 0..50 {
-        if let Some(status) = child.try_wait().context("failed to poll nested niri")? {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to poll nested {kind}"))?
+        {
             let text = fs::read_to_string(&log).unwrap_or_default();
-            bail!("nested niri exited with {status}; log follows:\n{text}");
+            terminate_child_group(&mut child);
+            bail!("nested {kind} exited with {status}; log follows:\n{text}");
         }
-
         let text = fs::read_to_string(&log).unwrap_or_default();
-        for line in text.lines() {
-            if let Some(value) = after(line, "listening on Wayland socket:") {
-                wayland_display = Some(value.to_owned());
-            }
-            if let Some(value) = after(line, "IPC listening on:") {
-                niri_socket = Some(PathBuf::from(value));
+        handles = backend.discover(&text);
+        if handles.is_none() {
+            if let Some(before) = &before {
+                match wl_cu::backend::hyprland::discover_new_instance(before) {
+                    Ok(discovered) => handles = discovered,
+                    Err(error) => {
+                        terminate_child_group(&mut child);
+                        return Err(error);
+                    }
+                }
             }
         }
-
-        if wayland_display.is_some() && niri_socket.is_some() {
+        if handles.is_some() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-
-    if wayland_display.is_none() || niri_socket.is_none() {
+    let Some(handles) = handles else {
         terminate_child_group(&mut child);
-        if wayland_display.is_none() {
-            bail!(
-                "nested niri did not report its Wayland socket; see {}",
-                log.display()
-            );
-        }
         bail!(
-            "nested niri did not report its IPC socket; see {}",
+            "nested {kind} did not report its Wayland and IPC handles; see {}",
             log.display()
         );
-    }
-    let wayland_display = wayland_display.expect("checked above");
-    let niri_socket = niri_socket.expect("checked above");
+    };
 
     let started = StartedSession {
         name: name.to_owned(),
+        compositor: kind,
         pid: child.id(),
-        wayland_display,
-        niri_socket,
+        wayland_display: handles.wayland_display,
+        ipc: handles.ipc,
         config,
         log,
     };
-
     state.sessions.insert(
         started.name.clone(),
         StoredSession {
+            compositor: started.compositor,
             pid: started.pid,
             wayland_display: started.wayland_display.clone(),
-            niri_socket: started.niri_socket.clone(),
+            ipc: started.ipc.clone(),
             log: started.log.clone(),
             process_group: true,
             processes: Vec::new(),
         },
     );
     write_session_state(&state)?;
-
     Ok(started)
 }
 
-fn activate_session(target: Option<&str>) -> Result<()> {
-    let state = read_session_state()?;
-    let name = target.context("pass --session NAME (session auto-detection is not supported)")?;
-    let session = state.sessions.get(name).with_context(|| {
-        format!("niri-cu session {name:?} is not known; run `niri-cu start {name}` first")
-    })?;
+fn prepare_compositor(
+    requested: Option<CompositorKind>,
+    target: Option<&str>,
+) -> Result<CompositorKind> {
+    if let Some(name) = target {
+        let stored = activate_session(name)?;
+        return Ok(requested.unwrap_or(stored));
+    }
+    requested.or_else(compositor::sniff_environment).context(
+        "pass --compositor niri|hyprland (no session or compositor environment was detected)",
+    )
+}
 
+fn activate_session(name: &str) -> Result<CompositorKind> {
+    let state = read_session_state()?;
+    let session = state.sessions.get(name).with_context(|| {
+        format!("wl-cu session {name:?} is not known; run `wl-cu start {name}` first")
+    })?;
     if !session_running(session) {
         bail!(
-            "niri-cu session {name:?} is not running (pid {} is gone)",
+            "wl-cu session {name:?} is not running (pid {} is gone)",
             session.pid
         );
     }
+    match session.compositor {
+        CompositorKind::Niri => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+        CompositorKind::Hyprland => std::env::remove_var("NIRI_SOCKET"),
+    }
+    let backend = compositor::backend(session.compositor);
+    for (key, value) in backend.session_env(&session_handles(session)) {
+        std::env::set_var(key, value);
+    }
+    Ok(session.compositor)
+}
 
-    std::env::set_var("WAYLAND_DISPLAY", &session.wayland_display);
-    std::env::set_var("NIRI_SOCKET", &session.niri_socket);
-    Ok(())
+fn session_handles(session: &StoredSession) -> SessionHandles {
+    SessionHandles {
+        wayland_display: session.wayland_display.clone(),
+        ipc: session.ipc.clone(),
+    }
 }
 
 fn read_session_state() -> Result<SessionState> {
@@ -899,7 +972,7 @@ fn read_session_state() -> Result<SessionState> {
 fn write_session_state(state: &SessionState) -> Result<()> {
     let path = session_state_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context("failed to create niri-cu runtime directory")?;
+        fs::create_dir_all(parent).context("failed to create wl-cu runtime directory")?;
     }
     fs::write(&path, serde_json::to_vec_pretty(state)?)
         .with_context(|| format!("failed to write session state to {}", path.display()))
@@ -909,26 +982,31 @@ fn session_state_path() -> Result<PathBuf> {
     Ok(session_dir()?.join("sessions.json"))
 }
 
-fn ensure_nested_config(name: &str) -> Result<PathBuf> {
-    let path = nested_config_path(name);
+fn ensure_nested_config(name: &str, compositor: &dyn Compositor) -> Result<PathBuf> {
+    let path = nested_config_path(name, compositor.kind());
     if path.exists() {
         return Ok(path);
     }
-
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config directory {}", parent.display()))?;
     }
-    fs::write(
-        &path,
-        "// Generated by niri-cu start. Edit this file to customize this nested session.\nlayout {\n    default-column-width { proportion 1.0; }\n}\n\nhotkey-overlay {\n    skip-at-startup\n}\n",
-    )
-    .with_context(|| format!("failed to write nested niri config to {}", path.display()))?;
+    let (_, template) = compositor.default_config();
+    fs::write(&path, template).with_context(|| {
+        format!(
+            "failed to write nested {} config to {}",
+            compositor.kind(),
+            path.display()
+        )
+    })?;
     Ok(path)
 }
 
-fn nested_config_path(name: &str) -> PathBuf {
-    config_dir().join("sessions").join(format!("{name}.kdl"))
+fn nested_config_path(name: &str, kind: CompositorKind) -> PathBuf {
+    let (extension, _) = compositor::backend(kind).default_config();
+    config_dir()
+        .join("sessions")
+        .join(format!("{name}.{extension}"))
 }
 
 fn config_dir() -> PathBuf {
@@ -940,14 +1018,14 @@ fn config_dir() -> PathBuf {
                 .unwrap_or_else(std::env::temp_dir)
                 .join(".config")
         })
-        .join("niri-cu")
+        .join("wl-cu")
 }
 
 fn session_dir() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    Ok(base.join("niri-cu"))
+    Ok(base.join("wl-cu"))
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -955,7 +1033,7 @@ fn process_exists(pid: u32) -> bool {
 }
 
 fn session_running(session: &StoredSession) -> bool {
-    process_exists(session.pid) && session.niri_socket.exists()
+    process_exists(session.pid) && session.ipc.exists()
 }
 
 fn signal_process(pid: u32, process_group: bool, signal: rustix::process::Signal) {
@@ -992,24 +1070,20 @@ fn validate_session_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn after<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
-    line.split_once(prefix).map(|(_, value)| value.trim())
-}
-
-fn run_niri_msg(args: Vec<String>) -> Result<()> {
-    let status = std::process::Command::new("niri")
-        .arg("msg")
+fn run_compositor_msg(compositor: &dyn Compositor, args: Vec<String>) -> Result<()> {
+    let mut command = compositor.msg_command();
+    let status = command
         .args(args)
         .status()
-        .context("failed to run `niri msg`")?;
-
+        .with_context(|| format!("failed to run {} message command", compositor.kind()))?;
     if !status.success() {
-        bail!("`niri msg` exited with {status}");
+        bail!("{} message command exited with {status}", compositor.kind());
     }
     Ok(())
 }
 
 fn click_times(
+    compositor: &dyn Compositor,
     x: u32,
     y: u32,
     button: MouseButton,
@@ -1017,7 +1091,7 @@ fn click_times(
     height: Option<u32>,
     count: u32,
 ) -> Result<()> {
-    let extent = pointer_extent(width, height)?;
+    let extent = pointer_extent(compositor, width, height)?;
     let mut client = pointer::Client::connect()?;
     client.move_absolute(x, y, extent)?;
     client.click_times(button.into(), count)?;
@@ -1027,6 +1101,7 @@ fn click_times(
 #[derive(Debug, Serialize)]
 struct Capabilities {
     version: &'static str,
+    compositors: &'static [&'static str],
     actions: &'static [&'static str],
     limitations: &'static [&'static str],
 }
@@ -1034,6 +1109,7 @@ struct Capabilities {
 fn capabilities() -> Capabilities {
     Capabilities {
         version: env!("CARGO_PKG_VERSION"),
+        compositors: &["niri", "hyprland"],
         actions: &[
             "start",
             "session",
@@ -1063,11 +1139,25 @@ fn capabilities() -> Capabilities {
     }
 }
 
-fn pointer_extent(width: Option<u32>, height: Option<u32>) -> Result<pointer::Extent> {
+fn pointer_extent(
+    compositor: &dyn Compositor,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<pointer::Extent> {
     match (width, height) {
         (Some(width), Some(height)) => Ok(pointer::Extent { width, height }),
-        (None, None) => niri::focused_output_extent()
-            .context("failed to infer extent from focused niri output; pass --width and --height"),
+        (None, None) => {
+            let extent = compositor.focused_output_extent().with_context(|| {
+                format!(
+                    "failed to infer extent from focused {} output; pass --width and --height",
+                    compositor.kind()
+                )
+            })?;
+            Ok(pointer::Extent {
+                width: extent.width,
+                height: extent.height,
+            })
+        }
         _ => anyhow::bail!("pass both --width and --height, or neither"),
     }
 }

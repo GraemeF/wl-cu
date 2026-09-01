@@ -89,7 +89,7 @@ impl Client {
         // The protocol requires a keymap upload before key events; send the
         // seat's own bytes back so nothing anywhere changes.
         let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
-        let memfd = rustix::fs::memfd_create("niri-cu-keymap", rustix::fs::MemfdFlags::CLOEXEC)
+        let memfd = rustix::fs::memfd_create("wl-cu-keymap", rustix::fs::MemfdFlags::CLOEXEC)
             .context("failed to create memfd for keymap")?;
         let mut file = File::from(memfd);
         file.write_all(&keymap_data)

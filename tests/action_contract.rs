@@ -1,4 +1,4 @@
-use niri_cu::actions::{keypress_combos, ActionBatch, ComputerAction};
+use wl_cu::actions::{keypress_combos, ActionBatch, ComputerAction};
 
 #[test]
 fn parses_the_ga_computer_action_vocabulary() {
