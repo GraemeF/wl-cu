@@ -1051,6 +1051,9 @@ fn terminate_child_group(child: &mut std::process::Child) {
     signal_process(child.id(), true, rustix::process::Signal::TERM);
     for _ in 0..20 {
         if child.try_wait().ok().flatten().is_some() {
+            // The compositor may leave helpers in its process group after its
+            // leader exits or crashes. Do not strand them on a failed start.
+            signal_process(child.id(), true, rustix::process::Signal::KILL);
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
