@@ -169,3 +169,10 @@ Failures print `{"error":"..."}` to stderr and exit nonzero. Successful input-on
 `cursor-position` is unavailable because Wayland clients cannot query the global pointer position. Only left, right, and middle mouse buttons are exposed. Unicode fallback requires the focused client to support `Ctrl+Shift+V` paste.
 
 Run `wl-cu capabilities` for the supported compositor and action lists.
+
+## License
+
+Copyright (C) 2026 Jonas Lergell.
+
+Licensed under the GNU General Public License, version 3 or later
+(`GPL-3.0-or-later`). See [LICENSE](LICENSE) for the full terms.

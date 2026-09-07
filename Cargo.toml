@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Compositor-portable computer-use CLI for Wayland"
+repository = "https://github.com/thrawny/wl-cu"
 
 [dependencies]
 anyhow = "1.0.100"
