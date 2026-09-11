@@ -753,10 +753,12 @@ fn with_pointer_modifiers<T>(
     }
 
     let mut keyboard = keyboard::Client::connect()?;
+    // Everything after the modifiers go down runs under `clear_modifiers`,
+    // including the sync: an early return anywhere in here leaves the seat
+    // holding modifiers that only this process knows about.
     keyboard.set_named_modifiers(keys)?;
-    keyboard.sync()?;
-    let action_result = action(&mut pointer);
-    let sync_result = action_result.and_then(|value| {
+    let sync_result = keyboard.sync().and_then(|()| {
+        let value = action(&mut pointer)?;
         pointer.sync()?;
         Ok(value)
     });
