@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn isolated_runtime_dir() -> PathBuf {
@@ -15,8 +15,8 @@ fn isolated_runtime_dir() -> PathBuf {
 
 /// A wl-cu invocation with no compositor within reach.
 ///
-/// Read-only mode refuses before compositor selection, so a refusal here is
-/// the guard's and nothing else's: without one, the same call fails asking for
+/// Every guard refuses before compositor selection, so a refusal here is the
+/// guard's and nothing else's: without one, the same call fails asking for
 /// `--compositor`, which the assertions below tell apart.
 fn cli(runtime: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_wl-cu"));
@@ -26,6 +26,8 @@ fn cli(runtime: &Path) -> Command {
     command.env_remove("HYPRLAND_INSTANCE_SIGNATURE");
     command.env_remove("WAYLAND_DISPLAY");
     command.env_remove("WL_CU_READ_ONLY");
+    command.env_remove("WL_CU_LOCKERS");
+    command.env_remove("WL_CU_ALLOW_LOCKED");
     command
 }
 
@@ -59,6 +61,28 @@ fn stderr_of(command: &mut Command) -> String {
     let output = command.output().expect("run wl-cu");
     assert!(!output.status.success(), "expected wl-cu to fail");
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// A process whose `comm` the lock guard is pointed at, reaped by the pid
+/// captured here however the test ends.
+struct Locker(Child);
+
+impl Locker {
+    fn spawn() -> Self {
+        Self(
+            Command::new("sleep")
+                .arg("120")
+                .spawn()
+                .expect("spawn stand-in locker"),
+        )
+    }
+}
+
+impl Drop for Locker {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[test]
@@ -124,13 +148,92 @@ fn capabilities_reports_whether_read_only_is_in_force() {
 }
 
 #[test]
+fn a_running_locker_refuses_input_and_leaves_observation_alone() {
+    let runtime = isolated_runtime_dir();
+    let _locker = Locker::spawn();
+
+    for refused in INPUT_CALLS {
+        let stderr = stderr_of(cli(&runtime).env("WL_CU_LOCKERS", "sleep").args(*refused));
+        assert!(
+            stderr.contains("the session is locked"),
+            "{refused:?} reached the seat while the session was locked: {stderr}"
+        );
+    }
+
+    let output = cli(&runtime)
+        .env("WL_CU_LOCKERS", "sleep")
+        .arg("sessions")
+        .output()
+        .expect("run wl-cu sessions");
+    assert!(
+        output.status.success(),
+        "the lock guard refused an observation subcommand: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(runtime).expect("remove isolated runtime directory");
+}
+
+/// A nested session has its own seat and is reached through its own Wayland
+/// socket, so a lock on the host session routes none of its input to the
+/// credential prompt. Reaching the unknown-session error is the proof the
+/// guard stood down.
+#[test]
+fn a_lock_on_the_host_session_does_not_reach_a_nested_target() {
+    let runtime = isolated_runtime_dir();
+    let _locker = Locker::spawn();
+
+    let stderr = stderr_of(cli(&runtime).env("WL_CU_LOCKERS", "sleep").args([
+        "--session",
+        "no-such-session",
+        "key",
+        "--combo",
+        "Return",
+    ]));
+    assert!(
+        !stderr.contains("the session is locked"),
+        "the lock guard fired on a nested target: {stderr}"
+    );
+    assert!(
+        stderr.contains("no-such-session"),
+        "expected the unknown-session error: {stderr}"
+    );
+
+    fs::remove_dir_all(runtime).expect("remove isolated runtime directory");
+}
+
+#[test]
+fn allow_locked_stands_the_lock_guard_down() {
+    let runtime = isolated_runtime_dir();
+    let _locker = Locker::spawn();
+
+    let stderr = stderr_of(
+        cli(&runtime)
+            .env("WL_CU_LOCKERS", "sleep")
+            .env("WL_CU_ALLOW_LOCKED", "1")
+            .args(["key", "--combo", "Return"]),
+    );
+    assert!(
+        !stderr.contains("the session is locked"),
+        "WL_CU_ALLOW_LOCKED did not stand the guard down: {stderr}"
+    );
+    assert!(
+        stderr.contains("--compositor"),
+        "expected the call to get as far as compositor selection: {stderr}"
+    );
+
+    fs::remove_dir_all(runtime).expect("remove isolated runtime directory");
+}
+
+/// Unset, neither guard costs a caller anything.
+#[test]
 fn neither_guard_refuses_when_it_is_not_configured() {
     let runtime = isolated_runtime_dir();
 
     let stderr = stderr_of(cli(&runtime).args(["key", "--combo", "Return"]));
     assert!(
         stderr.contains("--compositor"),
-        "read-only mode refused a call it was not set for: {stderr}"
+        "a guard refused an unconfigured call: {stderr}"
     );
 
     fs::remove_dir_all(runtime).expect("remove isolated runtime directory");

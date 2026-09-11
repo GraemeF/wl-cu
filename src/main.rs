@@ -309,6 +309,7 @@ fn run(requested: Option<CompositorKind>, session: Option<&str>, command: Comman
     // Ahead of compositor selection, so a refusal costs no IPC round trip and
     // does not depend on a session being reachable.
     guard::refuse_unless_read_only(command.name())?;
+    guard::refuse_while_locked(command.name(), session.is_some())?;
 
     match command {
         Command::Start { name } => {

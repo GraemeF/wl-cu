@@ -113,9 +113,9 @@ wl-cu --session test-niri key --combo ctrl+shift+t
 
 Typing reads the seat keymap and emits the keycodes and modifiers that produce each character. If the layout cannot produce a character, `wl-cu` publishes the string through Wayland data control and pastes it.
 
-## Read-only mode
+## Guards
 
-Without `--session`, `wl-cu` drives the seat a human is sitting at. Read-only mode narrows what it will do there. It is read from the environment rather than the command line, so it holds for every call an agent composes.
+Without `--session`, `wl-cu` drives the seat a human is sitting at. Two guards narrow what it will do there. Both are read from the environment rather than the command line, so they hold for every call an agent composes.
 
 `WL_CU_READ_ONLY` permits `observe`, `outputs`, `windows`, `focused`, `screenshot`, `capabilities`, `sessions` and `status`, and refuses everything else. It is an allowlist of what the mode permits, not a filter on input: `msg` passes its trailing arguments to `niri msg` or `hyprctl`, which reaches `action spawn`, so a mode defined as refusing input would still let a caller start processes in the session. `capabilities` reports the mode in `read_only` so a caller can see it without having a call refused.
 
@@ -123,6 +123,10 @@ Without `--session`, `wl-cu` drives the seat a human is sitting at. Read-only mo
 WL_CU_READ_ONLY=1 wl-cu screenshot          # captures
 WL_CU_READ_ONLY=1 wl-cu key --combo Return  # refused
 ```
+
+The other guard refuses pointer and keyboard input while a session locker is running. Neither compositor reports the lock — `niri-ipc` has no request for it and `hyprctl` exposes nothing — so `wl-cu` looks for a locker process in `/proc`, which is sound because ext-session-lock-v1 hands the session back the instant the locking client exits. `swaylock`, `swaylock-effects`, `hyprlock`, `gtklock` and `waylock` are recognised; `WL_CU_LOCKERS` takes a comma-separated list of further process names, and `WL_CU_ALLOW_LOCKED=1` stands the guard down for a caller that means to drive the credential prompt.
+
+It is positive detection, so an unreadable `/proc` refuses nothing rather than refusing everything, and it cannot see a locker that runs inside the compositor's shell process, because that process is up whether or not the session is locked. A nested session is exempt: it has its own seat and its own Wayland socket, so a lock on the host session routes none of its input to the credential prompt.
 
 ## Coordinates and frames
 
