@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use wl_cu::actions::{keypress_combos, ActionBatch, ComputerAction};
 use wl_cu::compositor::{self, Compositor, CompositorKind, SessionHandles};
-use wl_cu::{clipboard, keyboard, pointer, screenshot};
+use wl_cu::{clipboard, guard, keyboard, pointer, screenshot};
 
 #[derive(Debug, Parser)]
 #[command(name = "wl-cu")]
@@ -236,6 +236,40 @@ enum Command {
     Capabilities,
 }
 
+impl Command {
+    /// The name this subcommand is invoked by.
+    ///
+    /// The match is exhaustive, so a subcommand added later has to be named
+    /// here before it compiles. That is what keeps the allowlists in `guard`
+    /// failing closed: an unnamed subcommand cannot appear in one.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Start { .. } => "start",
+            Self::Session { .. } => "session",
+            Self::Sessions => "sessions",
+            Self::Status { .. } => "status",
+            Self::Stop { .. } => "stop",
+            Self::Exec { .. } => "exec",
+            Self::RunActions { .. } => "run-actions",
+            Self::Observe { .. } => "observe",
+            Self::Outputs { .. } => "outputs",
+            Self::Windows { .. } => "windows",
+            Self::Focused { .. } => "focused",
+            Self::Msg { .. } => "msg",
+            Self::Screenshot { .. } => "screenshot",
+            Self::Move { .. } => "move",
+            Self::Click { .. } => "click",
+            Self::DoubleClick { .. } => "double-click",
+            Self::TripleClick { .. } => "triple-click",
+            Self::Drag { .. } => "drag",
+            Self::Scroll { .. } => "scroll",
+            Self::Type { .. } => "type",
+            Self::Key { .. } => "key",
+            Self::Capabilities => "capabilities",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     /// Run the compositor message CLI against this session.
@@ -272,6 +306,10 @@ fn main() {
 }
 
 fn run(requested: Option<CompositorKind>, session: Option<&str>, command: Command) -> Result<()> {
+    // Ahead of compositor selection, so a refusal costs no IPC round trip and
+    // does not depend on a session being reachable.
+    guard::refuse_unless_read_only(command.name())?;
+
     match command {
         Command::Start { name } => {
             let kind = requested.or_else(compositor::sniff_environment).context(
@@ -1107,10 +1145,14 @@ struct Capabilities {
     compositors: &'static [&'static str],
     actions: &'static [&'static str],
     limitations: &'static [&'static str],
+    /// Whether read-only mode is in force. A caller that cannot see this
+    /// discovers the mode by having an action refused.
+    read_only: bool,
 }
 
 fn capabilities() -> Capabilities {
     Capabilities {
+        read_only: guard::read_only(),
         version: env!("CARGO_PKG_VERSION"),
         compositors: &["niri", "hyprland"],
         actions: &[

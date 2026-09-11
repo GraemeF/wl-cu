@@ -113,6 +113,17 @@ wl-cu --session test-niri key --combo ctrl+shift+t
 
 Typing reads the seat keymap and emits the keycodes and modifiers that produce each character. If the layout cannot produce a character, `wl-cu` publishes the string through Wayland data control and pastes it.
 
+## Read-only mode
+
+Without `--session`, `wl-cu` drives the seat a human is sitting at. Read-only mode narrows what it will do there. It is read from the environment rather than the command line, so it holds for every call an agent composes.
+
+`WL_CU_READ_ONLY` permits `observe`, `outputs`, `windows`, `focused`, `screenshot`, `capabilities`, `sessions` and `status`, and refuses everything else. It is an allowlist of what the mode permits, not a filter on input: `msg` passes its trailing arguments to `niri msg` or `hyprctl`, which reaches `action spawn`, so a mode defined as refusing input would still let a caller start processes in the session. `capabilities` reports the mode in `read_only` so a caller can see it without having a call refused.
+
+```bash
+WL_CU_READ_ONLY=1 wl-cu screenshot          # captures
+WL_CU_READ_ONLY=1 wl-cu key --combo Return  # refused
+```
+
 ## Coordinates and frames
 
 Pointer commands interpret coordinates against an extent. Without `--width` and `--height`, the focused output's logical size is the extent. Pass screenshot dimensions when coordinates came from a scaled image:
