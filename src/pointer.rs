@@ -154,16 +154,26 @@ impl Client {
 
         self.move_absolute(start.0, start.1, extent)?;
         std::thread::sleep(Duration::from_millis(20));
-        self.press(button)?;
-        std::thread::sleep(Duration::from_millis(20));
 
-        for &(x, y) in rest {
+        // A drag cannot batch its press and release into one flush the way
+        // `click_times` does, because the motion between them has to reach the
+        // compositor as it happens. So the release is unconditional instead:
+        // without it a failed motion returns while the seat still holds the
+        // button down, and nothing downstream lets go of it.
+        self.press(button)?;
+        let motion = self.drag_motion(rest, extent);
+        let release = self.release(button);
+        motion.and(release)
+    }
+
+    fn drag_motion(&mut self, path: &[(u32, u32)], extent: Extent) -> Result<()> {
+        std::thread::sleep(Duration::from_millis(20));
+        for &(x, y) in path {
             self.move_absolute(x, y, extent)?;
             std::thread::sleep(Duration::from_millis(10));
         }
-
         std::thread::sleep(Duration::from_millis(20));
-        self.release(button)
+        Ok(())
     }
 
     pub fn scroll(&mut self, dx: f64, dy: f64) -> Result<()> {

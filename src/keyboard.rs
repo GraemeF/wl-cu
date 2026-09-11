@@ -170,20 +170,35 @@ impl Client {
         self.flush()
     }
 
-    /// Like `send_stroke`, but keeps the key pressed for `hold`.
+    /// Like `send_stroke`, but keeps the key pressed for `hold`. The hold has
+    /// to reach the compositor as it happens, so press and release cannot share
+    /// a flush the way `send_stroke` batches them. The release is therefore
+    /// unconditional: a failure between the two would otherwise return with the
+    /// key and its modifiers still down, and nothing downstream lets go.
     fn send_stroke_held(&mut self, stroke: KeyStroke, hold: Duration) -> Result<()> {
         if stroke.mods != 0 {
             self.set_modifiers(stroke.mods)?;
         }
+        let held = self.hold_key(stroke, hold);
+        let release_key = self.release_key(stroke);
+        let release_mods = if stroke.mods != 0 {
+            self.set_modifiers(0)
+        } else {
+            Ok(())
+        };
+        held.and(release_key).and(release_mods)
+    }
+
+    fn hold_key(&mut self, stroke: KeyStroke, hold: Duration) -> Result<()> {
         self.keyboard.key(monotonic_millis(), stroke.keycode, 1);
         self.flush()?;
         std::thread::sleep(hold);
-        self.keyboard.key(monotonic_millis(), stroke.keycode, 0);
-        self.flush()?;
-        if stroke.mods != 0 {
-            self.set_modifiers(0)?;
-        }
         Ok(())
+    }
+
+    fn release_key(&mut self, stroke: KeyStroke) -> Result<()> {
+        self.keyboard.key(monotonic_millis(), stroke.keycode, 0);
+        self.flush()
     }
 
     fn set_modifiers(&mut self, depressed: u32) -> Result<()> {
