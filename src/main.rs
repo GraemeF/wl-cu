@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use wl_cu::actions::{keypress_combos, ActionBatch, ComputerAction};
+use wl_cu::clipboard::DEFAULT_PASTE_COMBO;
 use wl_cu::compositor::{self, Compositor, CompositorKind, SessionHandles};
 use wl_cu::{clipboard, keyboard, pointer, screenshot};
 
@@ -24,6 +25,12 @@ struct Cli {
     /// Select niri or Hyprland. Stored sessions remember this value.
     #[arg(long, global = true)]
     compositor: Option<CompositorKind>,
+
+    /// Key combination that makes the focused application paste, used only
+    /// when `type` falls back to the clipboard. The default is the terminal
+    /// binding; anything else needs its own.
+    #[arg(long, global = true, default_value = DEFAULT_PASTE_COMBO)]
+    paste_combo: String,
 
     #[command(subcommand)]
     command: Command,
@@ -234,6 +241,16 @@ enum Command {
     },
     /// Print the supported actions as JSON.
     Capabilities,
+    /// Hold a selection `type` saved, reading it from standard input.
+    ///
+    /// Spawned by `type`'s clipboard fallback and not meant to be run by hand:
+    /// a Wayland selection dies with the client offering it, so restoring one
+    /// means leaving a process behind to offer it.
+    #[command(hide = true)]
+    ClipboardServe {
+        #[arg(long)]
+        mime: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -265,14 +282,25 @@ impl From<MouseButton> for pointer::Button {
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(error) = run(cli.compositor, cli.session.as_deref(), cli.command) {
+    if let Err(error) = run(
+        cli.compositor,
+        cli.session.as_deref(),
+        &cli.paste_combo,
+        cli.command,
+    ) {
         eprintln!("{}", serde_json::json!({ "error": format!("{error:#}") }));
         std::process::exit(1);
     }
 }
 
-fn run(requested: Option<CompositorKind>, session: Option<&str>, command: Command) -> Result<()> {
+fn run(
+    requested: Option<CompositorKind>,
+    session: Option<&str>,
+    paste_combo: &str,
+    command: Command,
+) -> Result<()> {
     match command {
+        Command::ClipboardServe { mime } => clipboard::serve_selection(&mime),
         Command::Start { name } => {
             let kind = requested.or_else(compositor::sniff_environment).context(
                 "pass --compositor niri|hyprland (no compositor environment was detected)",
@@ -293,13 +321,14 @@ fn run(requested: Option<CompositorKind>, session: Option<&str>, command: Comman
         command => {
             let kind = prepare_compositor(requested, session)?;
             let backend = compositor::backend(kind);
-            run_compositor_command(session, command, backend.as_ref())
+            run_compositor_command(session, paste_combo, command, backend.as_ref())
         }
     }
 }
 
 fn run_compositor_command(
     session: Option<&str>,
+    paste_combo: &str,
     command: Command,
     compositor: &dyn Compositor,
 ) -> Result<()> {
@@ -318,6 +347,7 @@ fn run_compositor_command(
                 compositor,
                 input.as_deref(),
                 CoordinateSpace::new(frame_id.as_deref(), width, height)?,
+                paste_combo,
             )?,
             false,
         ),
@@ -403,14 +433,17 @@ fn run_compositor_command(
             }
             Ok(())
         }
-        Command::Type { text } => type_text(&text),
+        Command::Type { text } => type_text(&text, paste_combo),
         Command::Key { combo, hold } => keyboard::key_combo(&combo, hold),
         Command::Start { .. }
         | Command::Session { .. }
         | Command::Sessions
         | Command::Status { .. }
         | Command::Stop { .. }
-        | Command::Capabilities => unreachable!("handled before compositor selection"),
+        | Command::Capabilities
+        | Command::ClipboardServe { .. } => {
+            unreachable!("handled before compositor selection")
+        }
     }
 }
 
@@ -646,6 +679,7 @@ fn run_action_batch(
     compositor: &dyn Compositor,
     input: Option<&std::path::Path>,
     coordinates: CoordinateSpace,
+    paste_combo: &str,
 ) -> Result<ActionBatchResult> {
     let mut json = String::new();
     match input {
@@ -695,7 +729,7 @@ fn run_action_batch(
                 pointer.scroll_at(x, y, extent, *scroll_x, *scroll_y)
             })?,
             ComputerAction::Type { text } => {
-                type_text(text)?;
+                type_text(text, paste_combo)?;
             }
             ComputerAction::Keypress { keys } => {
                 let mut keyboard = keyboard::Client::connect()?;
@@ -734,9 +768,9 @@ fn action_button(button: wl_cu::actions::MouseButton) -> pointer::Button {
     }
 }
 
-fn type_text(text: &str) -> Result<()> {
+fn type_text(text: &str, paste_combo: &str) -> Result<()> {
     if let Err(keyboard_error) = keyboard::type_text(text) {
-        clipboard::paste_text(text).with_context(|| {
+        clipboard::paste_text(text, paste_combo).with_context(|| {
             format!("keyboard typing failed ({keyboard_error:#}); clipboard fallback also failed")
         })?;
     }
