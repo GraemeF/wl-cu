@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::guard;
 use anyhow::{bail, Context, Result};
 use wayland_client::globals::{registry_queue_init, BindError};
 use wayland_client::protocol::{wl_pointer, wl_registry};
@@ -69,6 +70,7 @@ impl Client {
         if extent.width == 0 || extent.height == 0 {
             bail!("pointer extent must be non-zero");
         }
+        guard::check()?;
 
         self.pointer
             .motion_absolute(now_millis(), x, y, extent.width, extent.height);
@@ -77,6 +79,7 @@ impl Client {
     }
 
     pub fn press(&mut self, button: Button) -> Result<()> {
+        guard::check()?;
         self.pointer.button(
             now_millis(),
             button.code(),
@@ -106,6 +109,7 @@ impl Client {
     /// tick stops clients from recognizing them as double/triple clicks.
     pub fn click_times(&mut self, button: Button, count: u32) -> Result<()> {
         for index in 0..count {
+            guard::check()?;
             let time = now_millis();
             self.pointer
                 .button(time, button.code(), wl_pointer::ButtonState::Pressed);
@@ -177,6 +181,7 @@ impl Client {
     }
 
     pub fn scroll(&mut self, dx: f64, dy: f64) -> Result<()> {
+        guard::check()?;
         self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
         if dy != 0.0 {
             self.pointer

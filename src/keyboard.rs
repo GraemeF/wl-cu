@@ -3,6 +3,7 @@ use std::io::Write as _;
 use std::os::fd::AsFd;
 use std::time::Duration;
 
+use crate::guard;
 use anyhow::{bail, Context, Result};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_keyboard, wl_registry, wl_seat};
@@ -158,6 +159,7 @@ impl Client {
     /// where a compositor stall delays the release past the client's
     /// key-repeat threshold, repeating the character.
     fn send_stroke(&mut self, stroke: KeyStroke) -> Result<()> {
+        guard::check()?;
         if stroke.mods != 0 {
             self.keyboard.modifiers(stroke.mods, 0, 0, 0);
         }
@@ -176,6 +178,7 @@ impl Client {
     /// unconditional: a failure between the two would otherwise return with the
     /// key and its modifiers still down, and nothing downstream lets go.
     fn send_stroke_held(&mut self, stroke: KeyStroke, hold: Duration) -> Result<()> {
+        guard::check()?;
         if stroke.mods != 0 {
             self.set_modifiers(stroke.mods)?;
         }
@@ -207,6 +210,7 @@ impl Client {
     }
 
     pub fn set_named_modifiers(&mut self, names: &[String]) -> Result<()> {
+        guard::check()?;
         let mut modifiers = 0u32;
         for name in names {
             let mask = modifier_mod_name(name)

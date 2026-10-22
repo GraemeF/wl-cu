@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use wl_cu::actions::{keypress_combos, ActionBatch, ComputerAction};
 use wl_cu::clipboard::DEFAULT_PASTE_COMBO;
 use wl_cu::compositor::{self, Compositor, CompositorKind, SessionHandles};
+use wl_cu::guard::{self, FocusGuard};
 use wl_cu::{clipboard, keyboard, pointer, screenshot};
 
 #[derive(Debug, Parser)]
@@ -25,6 +26,12 @@ struct Cli {
     /// Select niri or Hyprland. Stored sessions remember this value.
     #[arg(long, global = true)]
     compositor: Option<CompositorKind>,
+
+    /// The window that pointer and keyboard input is meant for, as the `id`
+    /// that `focused` prints. Before every event, input is refused if another
+    /// window (or none) has focus, and nothing is sent.
+    #[arg(long, global = true)]
+    window: Option<String>,
 
     /// Key combination that makes the focused application paste, used only
     /// when `type` falls back to the clipboard. The default is the terminal
@@ -285,6 +292,7 @@ fn main() {
     if let Err(error) = run(
         cli.compositor,
         cli.session.as_deref(),
+        cli.window,
         &cli.paste_combo,
         cli.command,
     ) {
@@ -296,6 +304,7 @@ fn main() {
 fn run(
     requested: Option<CompositorKind>,
     session: Option<&str>,
+    window: Option<String>,
     paste_combo: &str,
     command: Command,
 ) -> Result<()> {
@@ -321,9 +330,28 @@ fn run(
         command => {
             let kind = prepare_compositor(requested, session)?;
             let backend = compositor::backend(kind);
+            if let Some(window) = window.filter(|_| sends_input(&command)) {
+                guard::install(FocusGuard::for_compositor(window, kind));
+                guard::check()?;
+            }
             run_compositor_command(session, paste_combo, command, backend.as_ref())
         }
     }
+}
+
+fn sends_input(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::RunActions { .. }
+            | Command::Move { .. }
+            | Command::Click { .. }
+            | Command::DoubleClick { .. }
+            | Command::TripleClick { .. }
+            | Command::Drag { .. }
+            | Command::Scroll { .. }
+            | Command::Type { .. }
+            | Command::Key { .. }
+    )
 }
 
 fn run_compositor_command(
@@ -770,6 +798,9 @@ fn action_button(button: wl_cu::actions::MouseButton) -> pointer::Button {
 
 fn type_text(text: &str, paste_combo: &str) -> Result<()> {
     if let Err(keyboard_error) = keyboard::type_text(text) {
+        if guard::is_refusal(&keyboard_error) {
+            return Err(keyboard_error);
+        }
         clipboard::paste_text(text, paste_combo).with_context(|| {
             format!("keyboard typing failed ({keyboard_error:#}); clipboard fallback also failed")
         })?;
